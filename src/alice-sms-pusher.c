@@ -1,5 +1,4 @@
 #include <time.h>
-#include <regex.h>
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -50,19 +49,13 @@ static int g_webui_restart_port;
 // 函数声明
 static pid_t get_strace_pid_from_file(void);
 static void set_strace_pid_to_file(pid_t pid);
-void extract_write_lines_from_log(void);
-void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen);
 int send_webhook_msg(const char *webhook, const char *platform,
                      const char *txt, const char *custom_ctype,
                      const char *custom_body);
-void send_dingtalk_msg(const char *webhook, const char *txt);
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt);
 void print_mbedtls_error(int ret, const char *msg);
 void parse_url(const char *url, char **host, char **path);
 void signal_handler(int sig);
 int find_zte_mifi_pid(void);
-void trace_zte_mifi(void);
-void rerun_strace_zte_mifi(void);
 static int run_webui(const char *self_path, int port);
 static void json_escape(char *out, size_t outsz, const char *in);
 static void safe_copy(char *dst, size_t dstsz, const char *src);
@@ -183,85 +176,6 @@ static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *ou
     return 0;
 }
 
-void trace_zte_mifi() {
-    int pid = find_zte_mifi_pid();
-    if (pid <= 0) {
-        fprintf(stderr, "zte_mifi进程未找到\n");
-        return;
-    }
-    while (1) {
-        pid_t strace_pid = 0;
-        int read_fd = -1;
-        if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
-            perror("start_strace_with_pipe");
-            return;
-        }
-        set_strace_pid_to_file(strace_pid);
-        time_t next_midnight = get_next_midnight_epoch();
-
-        char partial[MAX_BUFFER_LEN];
-        size_t partial_len = 0;
-        while (1) {
-            struct pollfd pfd;
-            memset(&pfd, 0, sizeof(pfd));
-            pfd.fd = read_fd;
-            pfd.events = POLLIN;
-            int pr = poll(&pfd, 1, 500);
-            if (pr > 0 && (pfd.revents & POLLIN)) {
-                char buf[1024];
-                ssize_t n = read(read_fd, buf, sizeof(buf));
-                if (n > 0) {
-                    size_t i;
-                    for (i = 0; i < (size_t)n; i++) {
-                        char c = buf[i];
-                        if (partial_len + 1 < sizeof(partial)) {
-                            partial[partial_len++] = c;
-                        }
-                        if (c == '\n') {
-                            partial[partial_len] = 0;
-                            fputs(partial, stdout);
-                            partial_len = 0;
-                        }
-                        if (partial_len + 1 >= sizeof(partial)) {
-                            partial[partial_len] = 0;
-                            fputs(partial, stdout);
-                            partial_len = 0;
-                        }
-                    }
-                } else if (n == 0) {
-                    break;
-                } else {
-                    if (errno != EAGAIN && errno != EINTR) break;
-                }
-            }
-            time_t now = time(NULL);
-            if (now >= next_midnight) {
-                kill(strace_pid, SIGTERM);
-                int wait_count = 0;
-                while (wait_count < 10) {
-                    if (kill(strace_pid, 0) != 0) break;
-                    usleep(100*1000);
-                    wait_count++;
-                }
-                if (kill(strace_pid, 0) == 0) {
-                    kill(strace_pid, SIGKILL);
-                    usleep(200*1000);
-                }
-                int ztepid = find_zte_mifi_pid();
-                if (ztepid > 0) kill(ztepid, SIGCONT);
-                break;
-            }
-            int status = 0;
-            pid_t w = waitpid(strace_pid, &status, WNOHANG);
-            if (w == strace_pid) break;
-        }
-        close(read_fd);
-        waitpid(strace_pid, NULL, 0);
-        pid = find_zte_mifi_pid();
-        if (pid <= 0) return;
-    }
-}
-
 // 用文件记录strace子进程pid，便于跨进程kill
 static pid_t get_strace_pid_from_file() {
     FILE *fp = fopen("/tmp/zte_strace.pid", "r");
@@ -279,37 +193,11 @@ static void set_strace_pid_to_file(pid_t pid) {
     }
 }
 
-// 立即清空 /tmp/zte_log.txt 并重启 strace 跟踪（优雅kill，保护zte_mifi）
-void rerun_strace_zte_mifi() {
-    pid_t oldpid = get_strace_pid_from_file();
-    if (oldpid > 0) {
-        // 优先SIGTERM优雅退出
-        kill(oldpid, SIGTERM);
-        int wait_count = 0;
-        while (wait_count < 10) { // 最多等1秒
-            if (kill(oldpid, 0) != 0) break; // 已退出
-            usleep(100*1000);
-            wait_count++;
-        }
-        // 若还在则SIGKILL
-        if (kill(oldpid, 0) == 0) {
-            kill(oldpid, SIGKILL);
-            usleep(200*1000);
-        }
-        // 杀完strace后，给zte_mifi发SIGCONT，防止其被挂起
-        int ztepid = find_zte_mifi_pid();
-        if (ztepid > 0) {
-            kill(ztepid, SIGCONT);
-        }
-    }
-}
-
 // 查找 /sbin/zte_mifi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
 int find_zte_mifi_pid() {
     DIR *dir;
     struct dirent *entry;
     char path[256], buf[256];
-    FILE *fp;
     int pid = -1;
     dir = opendir("/proc");
     if (!dir) return -1;
@@ -333,7 +221,7 @@ int find_zte_mifi_pid() {
 
 // strace线程函数 - 执行 strace 跟踪 zte_mifi 进程的 read/write 系统调用
 void* strace_thread_func(void* arg) {
-    char* webhook = (char*)arg;
+    (void)arg;
 
     while (threads_running) {
         int pid = find_zte_mifi_pid();
@@ -443,27 +331,6 @@ void* pdu_thread_func(void* arg) {
     return NULL;
 }
 
-// 提取 /tmp/zte_log.txt 中所有 write(数字, "内容", 数字) = 数字 的行
-void extract_write_lines_from_log() {
-    FILE *fp = fopen("/tmp/zte_log.txt", "r");
-    if (!fp) {
-        perror("fopen /tmp/zte_log.txt");
-        return;
-    }
-    char line[2048];
-    // 匹配 write(数字, "内容", 数字) = 数字
-    regex_t reg;
-    // 匹配如: write(16, "...", 91) = 91
-    regcomp(&reg, "^\\s*write\\([0-9]+, \\\".*\\\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
-    while (fgets(line, sizeof(line), fp)) {
-        if (regexec(&reg, line, 0, NULL, 0) == 0) {
-            printf("%s", line);
-        }
-    }
-    regfree(&reg);
-    fclose(fp);
-}
-
 // PDU解码信息结构体和解码函数
 
 typedef struct {
@@ -524,12 +391,6 @@ void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char
     }
 }
 
-static char last_sender[32] = "";
-static char last_text[2048] = "";
-static time_t last_sms_time = 0;
-static char last_pdu[256] = "";
-static time_t last_pdu_time = 0;
-static time_t service_start_time = 0;
 static char device_msisdn[64] = "";
 
 static void load_device_msisdn_from_nv_show(void) {
@@ -701,35 +562,6 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     free(ucs2_hex);
 }
 
-// 为保持兼容性保留的旧函数
-static char last_sms_compat[256] = "";
-static time_t last_sms_time_compat = 0;
-
-void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen) {
-    // 假设pdu内容全为UCS2编码的16进制字符串
-    size_t len = strlen(pdu);
-    size_t i = 0, j = 0;
-    // 兼容原逻辑：如果长度太短直接返回空
-    if (len < 4) { out[0] = 0; return; }
-    while (i + 3 < len && j + 3 < outlen) {
-        unsigned int ucs2;
-        if (sscanf(pdu + i, "%4x", &ucs2) != 1) break;
-        if (ucs2 == 0) break;
-        if (ucs2 < 0x80) {
-            out[j++] = (char)ucs2;
-        } else if (ucs2 < 0x800) {
-            out[j++] = 0xC0 | (ucs2 >> 6);
-            out[j++] = 0x80 | (ucs2 & 0x3F);
-        } else {
-            out[j++] = 0xE0 | (ucs2 >> 12);
-            out[j++] = 0x80 | ((ucs2 >> 6) & 0x3F);
-            out[j++] = 0x80 | (ucs2 & 0x3F);
-        }
-        i += 4;
-    }
-    out[j] = 0;
-}
-
 static void form_url_escape(char *out, size_t outsz, const char *in) {
     static const char hex[] = "0123456789ABCDEF";
     size_t used = 0;
@@ -759,10 +591,8 @@ static int replace_token(char *out, size_t outsz, const char *token,
     size_t vlen = strlen(value ? value : "");
     char *p = strstr(out, token);
     size_t tail_len;
-    size_t used;
 
     while (p) {
-        used = strlen(out);
         tail_len = strlen(p + tlen);
         if ((size_t)(p - out) + vlen + tail_len >= outsz)
             return -1;
@@ -1015,8 +845,36 @@ int send_webhook_msg(const char *webhook, const char *platform,
     return post_https_body(webhook, ctype, payload, p);
 }
 
-void send_dingtalk_msg(const char *webhook, const char *txt) {
-    (void)send_webhook_msg(webhook, "dingtalk", txt, NULL, NULL);
+static void append_message_text(char *out, size_t outsz, const char *text) {
+    size_t used;
+    size_t left;
+
+    if (!out || outsz == 0 || !text || !text[0])
+        return;
+    used = strlen(out);
+    if (used >= outsz - 1)
+        return;
+    left = outsz - used - 1;
+    strncat(out, text, left);
+}
+
+static void build_push_message(char *out, size_t outsz,
+                               const char *headtxt,
+                               const char *body,
+                               const char *tailtxt) {
+    if (!out || outsz == 0)
+        return;
+    out[0] = 0;
+    if (headtxt && headtxt[0]) {
+        append_message_text(out, outsz, headtxt);
+        append_message_text(out, outsz, "\n");
+    }
+    append_message_text(out, outsz, body);
+    if (tailtxt && tailtxt[0]) {
+        if (out[0])
+            append_message_text(out, outsz, "\n");
+        append_message_text(out, outsz, tailtxt);
+    }
 }
 
 static void process_strace_line_for_sms(const char *line, const char *webhook,
@@ -1025,8 +883,6 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
                                         const char *custom_body,
                                         const char *headtxt,
                                         const char *tailtxt) {
-    (void)headtxt;
-    (void)tailtxt;
     char local[MAX_BUFFER_LEN];
     strncpy(local, line, sizeof(local) - 1);
     local[sizeof(local) - 1] = 0;
@@ -1034,12 +890,9 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
     char *p = strstr(local, "+CMT: ");
     if (p) {
         char *first_crlf = strstr(p, "\\r\\n");
-        printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-local) : -1L);
         if (first_crlf) {
             char *pdu_start = first_crlf + 4;
-            printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-local));
             char *pdu_end = strstr(pdu_start, "\\r\\n");
-            if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-local));
             char pdu[2048] = "";
             if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
                 strncpy(pdu, pdu_start, pdu_end - pdu_start);
@@ -1048,15 +901,16 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
                 strncpy(pdu, pdu_start, sizeof(pdu)-1);
                 pdu[sizeof(pdu)-1] = 0;
             }
-            printf("[DEBUG] pdu_raw: %s\n", pdu);
-            printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
             char *pdubegin = pdu;
             while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
             char *pdu_trim = pdubegin;
-            char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
-            while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
-            printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
-            printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
+            size_t trim_len = strlen(pdu_trim);
+            if (trim_len > 0) {
+                char *pdutail = pdu_trim + trim_len - 1;
+                while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) {
+                    *pdutail-- = 0;
+                }
+            }
             if (pdu_trim[0]) {
                 int valid_pdu = 1;
                 size_t pdu_len = strlen(pdu_trim);
@@ -1072,13 +926,12 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
                 if (valid_pdu) {
                     sms_info_t info;
                     decode_pdu(pdu_trim, &info);
-                    printf("[DEBUG] sms_decoded: %s\n", info.text);
-                    printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
                     size_t textlen = strlen(info.text);
                     if (textlen > 0) {
                         if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
                             add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
                             char msg[1024];
+                            char final_msg[2048];
                             snprintf(msg, sizeof(msg),
                                 "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
                                 device_msisdn[0] ? device_msisdn : "N/A",
@@ -1086,113 +939,16 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
                                 info.sender[0] ? info.sender : "N/A",
                                 info.timestamp[0] ? info.timestamp : "N/A",
                                 info.text);
-                            send_webhook_msg(webhook, platform, msg,
+                            build_push_message(final_msg, sizeof(final_msg),
+                                               headtxt, msg, tailtxt);
+                            send_webhook_msg(webhook, platform, final_msg,
                                              custom_ctype, custom_body);
-                        } else {
-                            printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
                         }
                     }
-                } else {
-                    printf("[DEBUG] skip invalid pdu: %s\n", pdu_trim);
                 }
-            }
-        } else {
-            printf("[DEBUG] first_crlf not found after +CMT:\n");
-        }
-    }
-}
-
-// 兼容旧日志文件提取入口，保留钉钉默认格式。
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt) {
-    FILE *fp = fopen("/tmp/zte_log.txt", "r");
-    if (!fp) return;
-    char line[2048];
-    regex_t reg;
-    // 匹配如: write(16, "...", 91) = 91，兼容C regex语法，不用\s和\)
-    regcomp(&reg, "^[ \t]*write\\([0-9]+, \".*\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
-    int line_num = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        line_num++;
-        int is_write = (regexec(&reg, line, 0, NULL, 0) == 0);
-        char *p = strstr(line, "+CMT: ");
-        // printf("[DEBUG] line %d: %s", line_num, line);
-        // printf("[DEBUG] is_write: %d\n", is_write);
-        // printf("[DEBUG] +CMT: pos: %ld\n", p ? (long)(p-line) : -1L);
-        if (p) {
-            // 修改这里：在strace输出中，换行符是字符串"\r\n"而不是实际的\r\n字符
-            char *first_crlf = strstr(p, "\\r\\n");
-            printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-line) : -1L);
-            if (first_crlf) {
-                // 修改这里：跳过"\r\n"字符串（4个字符）
-                char *pdu_start = first_crlf + 4;
-                printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-line));
-                // 同样查找结束标记也需要查找字符串"\r\n"
-                char *pdu_end = strstr(pdu_start, "\\r\\n");
-                if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-line));
-                char pdu[2048] = "";
-                if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
-                    strncpy(pdu, pdu_start, pdu_end - pdu_start);
-                    pdu[pdu_end - pdu_start] = 0;
-                } else {
-                    strncpy(pdu, pdu_start, sizeof(pdu)-1);
-                    pdu[sizeof(pdu)-1] = 0;
-                }
-                printf("[DEBUG] pdu_raw: %s\n", pdu);
-                printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
-                char *pdubegin = pdu;
-                while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
-                char *pdu_trim = pdubegin;
-                char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
-                while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
-                printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
-                printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
-                if (pdu_trim[0]) {
-                    // 过滤异常PDU：长度至少20且全为十六进制字符
-                    int valid_pdu = 1;
-                    size_t pdu_len = strlen(pdu_trim);
-                    size_t pi;
-                    if (pdu_len < 20) valid_pdu = 0;
-                    for (pi = 0; pi < pdu_len; pi++) {
-                        char c = pdu_trim[pi];
-                        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
-                            valid_pdu = 0;
-                            break;
-                        }
-                    }
-                    if (valid_pdu) {
-                        sms_info_t info;
-                        decode_pdu(pdu_trim, &info);
-                        printf("[DEBUG] sms_decoded: %s\n", info.text);
-                        printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
-                        size_t textlen = strlen(info.text);
-                        if (textlen > 0) { // 只推送有内容的短信
-                            // 新去重机制：Sender+TimeStamp+Text三元组唯一
-                            if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
-                                add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
-                                char msg[1024];
-                                snprintf(msg, sizeof(msg),
-                                    "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
-                                    device_msisdn[0] ? device_msisdn : "N/A",
-                                    info.smsc[0] ? info.smsc : "N/A",
-                                    info.sender[0] ? info.sender : "N/A",
-                                    info.timestamp[0] ? info.timestamp : "N/A",
-                                    info.text);
-                                send_dingtalk_msg(webhook, msg);
-                            } else {
-                                printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
-                            }
-                        }
-                    } else {
-                        printf("[DEBUG] skip invalid pdu: %s\n", pdu_trim);
-                    }
-                }
-            } else {
-                printf("[DEBUG] first_crlf not found after +CMT:\n");
             }
         }
     }
-    regfree(&reg);
-    fclose(fp);
 }
 
 // 打印 mbedtls 错误码的帮助函数
@@ -1227,6 +983,7 @@ void parse_url(const char *url, char **host, char **path) {
 
 // 信号处理函数，用于优雅关闭线程
 void signal_handler(int sig) {
+    (void)sig;
     threads_running = 0;
     
     // 给线程一些时间来清理
@@ -1823,9 +1580,9 @@ static void load_web_config(web_config_t *cfg) {
         else if (strcmp(line, "num") == 0)
             safe_copy(cfg->num, sizeof(cfg->num), eq);
         else if (strcmp(line, "headtxt") == 0)
-            safe_copy(cfg->headtxt, sizeof(cfg->headtxt), eq);
+            config_unescape(cfg->headtxt, sizeof(cfg->headtxt), eq);
         else if (strcmp(line, "tailtxt") == 0)
-            safe_copy(cfg->tailtxt, sizeof(cfg->tailtxt), eq);
+            config_unescape(cfg->tailtxt, sizeof(cfg->tailtxt), eq);
         else if (strcmp(line, "port") == 0) {
             long port;
             char *end;
@@ -1845,10 +1602,14 @@ static void load_web_config(web_config_t *cfg) {
 static int save_web_config(const web_config_t *cfg) {
     FILE *fp;
     char esc_body[8192];
+    char esc_head[1024];
+    char esc_tail[1024];
 
     if (mkdir_parent_file(DEFAULT_CONFIG_PATH) < 0)
         return -1;
     config_escape(esc_body, sizeof(esc_body), cfg->custom_body);
+    config_escape(esc_head, sizeof(esc_head), cfg->headtxt);
+    config_escape(esc_tail, sizeof(esc_tail), cfg->tailtxt);
     fp = fopen(DEFAULT_CONFIG_PATH, "w");
     if (!fp) return -1;
     fprintf(fp, "webhook=%s\n", cfg->webhook);
@@ -1856,8 +1617,8 @@ static int save_web_config(const web_config_t *cfg) {
     fprintf(fp, "custom_ctype=%s\n", cfg->custom_ctype);
     fprintf(fp, "custom_body=%s\n", esc_body);
     fprintf(fp, "num=%s\n", cfg->num);
-    fprintf(fp, "headtxt=%s\n", cfg->headtxt);
-    fprintf(fp, "tailtxt=%s\n", cfg->tailtxt);
+    fprintf(fp, "headtxt=%s\n", esc_head);
+    fprintf(fp, "tailtxt=%s\n", esc_tail);
     fprintf(fp, "port=%d\n", cfg->port > 0 ? cfg->port : DEFAULT_WEBUI_PORT);
     if (fclose(fp) != 0)
         return -1;
@@ -2106,12 +1867,12 @@ static int start_service(const char *self_path, const web_config_t *cfg) {
     if (pid == 0) {
         char url_arg[1200];
         char num_arg[180];
-        char head_arg[320];
-        char tail_arg[320];
         char platform_arg[80];
         char custom_ctype_arg[180];
         char custom_body_arg[2300];
-        char *args[16];
+        char head_arg[360];
+        char tail_arg[360];
+        char *args[14];
         int n = 0;
         int logfd;
 
@@ -2246,20 +2007,6 @@ static void http_send_data(int fd, int code, const char *status,
     send_all_plain(fd, (const char *)data, data_len);
 }
 
-static void http_redirect(int fd, const char *location) {
-    char header[256];
-    int len = snprintf(header, sizeof(header),
-        "HTTP/1.1 303 See Other\r\n"
-        "Location: %s\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: close\r\n"
-        "Cache-Control: no-store\r\n"
-        "\r\n",
-        location);
-    if (len > 0)
-        send_all_plain(fd, header, (size_t)len);
-}
-
 static void append_page_start(char *body, size_t bodysz, const char *active,
                               const char *title, const char *subtitle,
                               const char *message) {
@@ -2281,7 +2028,7 @@ static void append_page_start(char *body, size_t bodysz, const char *active,
         ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.panel{background:#fff;border:1px solid #d9e5dc;border-radius:8px;margin-bottom:14px;box-shadow:0 5px 16px rgba(24,37,29,.045);overflow:hidden;animation:rise .22s ease-out}.formtop{border-bottom:1px solid #e7eee8;padding:14px 16px}.title{font-size:16px;font-weight:800}.pad{padding:16px}.kv{border-bottom:1px solid #edf2ee;padding:8px 0}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:800;word-break:break-all;margin-top:3px}"
         "label{display:block;font-size:13px;font-weight:800;margin:11px 0 5px}input,textarea,select{width:100%%;border:1px solid #b8c7bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none}input,select{height:40px}textarea{min-height:84px;resize:vertical}input:focus,textarea:focus,select:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.fieldrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}.fieldrow button{margin:0}.hint.ok{color:#236a40}.hint.warn{color:#9a5a10}"
         ".custombox{display:none;margin-top:10px;padding:12px;border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;animation:rise .18s ease-out}.custombox.show{display:block}"
-        ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer}button.alt{background:#fff;color:#2f7d4f}pre{white-space:pre-wrap;word-break:break-word;background:#101811;color:#d9f5df;border-radius:8px;padding:12px;max-height:520px;overflow:auto}"
+        ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer}button.alt{background:#fff;color:#2f7d4f}pre,.preview{white-space:pre-wrap;word-break:break-word;background:#101811;color:#d9f5df;border-radius:8px;padding:12px;max-height:520px;overflow:auto}.preview{margin-top:8px;min-height:116px;color:#e3f8e7}"
         ".templates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.tpl{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:12px}.tplname{font-size:14px;font-weight:800}.tpltext{font-size:12px;color:#56695e;line-height:1.6;margin-top:5px;word-break:break-all}.tplcode{font-family:monospace;background:#eef6ef;border-radius:6px;padding:5px 6px;color:#234732}"
         ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.labelrow{margin-top:13px;color:#5f7166;font-size:13px;font-weight:800}.labelrow .repo{margin-top:0}.supporthead{display:block}.supportdesc{color:#405246;font-size:14px;font-weight:700;line-height:1.75;margin-top:7px}.supportgrid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px;align-items:stretch}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.plainlink{display:inline-block;color:#1f6d42;font-weight:800;word-break:break-all}.qrbox{display:flex;justify-content:center;align-items:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
         "@media(max-width:820px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc}.nav{flex-direction:row;overflow:auto}.sidecard{display:none}main.page{padding:16px}.grid,.about,.supportgrid,.templates{grid-template-columns:1fr}.topline{display:block}.qr{max-width:220px}}"
@@ -2308,11 +2055,16 @@ static void append_page_end(char *body, size_t bodysz) {
         "if(m){m.textContent='正在读取 nv show...';m.className='hint';}"
         "if(b){b.disabled=true;b.textContent='获取中';}"
         "fetch('/msisdn',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){"
-        "if(i&&j.num){i.value=j.num;i.focus();if(m){m.textContent='已读取手机号。';m.className='hint ok';}}"
+        "if(i&&j.num){i.value=j.num;i.focus();updatePreview();if(m){m.textContent='已读取手机号。';m.className='hint ok';}}"
         "else{if(m){m.textContent='未从 nv show 读取到手机号，请手动填写或留空。';m.className='hint warn';}}"
         "}).catch(function(){if(m){m.textContent='读取失败，请检查设备是否支持 nv show。';m.className='hint warn';}})"
         ".finally(function(){if(b){b.disabled=false;b.textContent='获取';}});}"
-        "toggleCustom();"
+        "function enc(s){return encodeURIComponent(s).replace(/[!'()*]/g,function(c){return '%'+c.charCodeAt(0).toString(16).toUpperCase();});}"
+        "function jesc(s){return JSON.stringify(s||'').slice(1,-1);}"
+        "function barkKey(u){var s=(u||''),i=s.indexOf('://');if(i>=0)s=s.slice(i+3);i=s.indexOf('/');if(i<0)return '';s=s.slice(i+1);if(!s||s.indexOf('push')===0)return '';return s.split(/[/?#]/)[0];}"
+        "function sampleText(){var n=document.getElementById('numInput'),num=n&&n.value?n.value:'N/A';return '接收短信设备手机号:'+num+'\\n[pdu解码后的信息]\\n短消息服务中心:+8613800755500\\n发件人:10086\\n时间戳:26/06/30 12:00:00\\n短信内容:Alice Pusher Bot 示例短信';}"
+        "function updatePreview(){var h=document.getElementById('headInput'),t=document.getElementById('tailInput'),p=document.getElementById('msgPreview'),s=document.getElementById('platformSelect'),w=document.getElementById('webhookInput'),ct=document.getElementById('ctypeInput'),cb=document.getElementById('customBodyInput');if(!p)return;var a=[],text,plat=s?s.value:'dingtalk',ctype='application/json;charset=utf-8',payload='',jt,key,tmpl;if(h&&h.value)a.push(h.value);a.push(sampleText());if(t&&t.value)a.push(t.value);text=a.join('\\n');if(plat==='serverchan'){ctype='application/x-www-form-urlencoded';payload='title=Alice%20Pusher&desp='+enc(text);}else if(plat==='telegram'){ctype='application/x-www-form-urlencoded';payload='text='+enc(text);}else if(plat==='custom'){ctype=(ct&&ct.value)||'application/json;charset=utf-8';tmpl=(cb&&cb.value)||'{\"text\":\"{{json_text}}\"}';payload=tmpl.split('{{json_text}}').join(jesc(text)).split('{{url_text}}').join(enc(text)).split('{{text}}').join(text);}else{jt=jesc(text);if(plat==='feishu')payload='{\"msg_type\":\"text\",\"content\":{\"text\":\"'+jt+'\"}}';else if(plat==='discord')payload='{\"content\":\"'+jt+'\"}';else if(plat==='bark'){key=barkKey(w&&w.value);payload=key?'{\"title\":\"Alice Pusher\",\"body\":\"'+jt+'\",\"device_key\":\"'+jesc(key)+'\"}':'需要填写 Bark URL 以提取 device_key';}else payload='{\"msgtype\":\"text\",\"text\":{\"content\":\"'+jt+'\"}}';}p.textContent='最终文本:\\n'+text+'\\n\\nContent-Type:\\n'+ctype+'\\n\\nPayload:\\n'+payload;}"
+        "toggleCustom();updatePreview();"
         "</script></body></html>");
 }
 
@@ -2402,7 +2154,9 @@ static void render_config(int fd, const char *message) {
     web_config_t cfg;
     char *body = calloc(1, WEB_BODY_MAX);
     char *custom_body = calloc(1, 12288);
-    char webhook[2048], num[256], head[512], tail[512];
+    char webhook[2048], num[256], head[1024], tail[1024];
+    char sample_body[1024], sample_final[2048], sample_payload[4096];
+    char sample_ctype[160], sample_preview[8192], sample_preview_esc[20000];
     char custom_ctype[256];
     int port;
 
@@ -2419,19 +2173,36 @@ static void render_config(int fd, const char *message) {
     html_escape(tail, sizeof(tail), cfg.tailtxt);
     html_escape(custom_ctype, sizeof(custom_ctype), cfg.custom_ctype);
     html_escape(custom_body, 12288, cfg.custom_body);
+    snprintf(sample_body, sizeof(sample_body),
+             "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:+8613800755500\n发件人:10086\n时间戳:26/06/30 12:00:00\n短信内容:Alice Pusher Bot 示例短信",
+             cfg.num[0] ? cfg.num : "N/A");
+    build_push_message(sample_final, sizeof(sample_final),
+                       cfg.headtxt, sample_body, cfg.tailtxt);
+    if (build_webhook_payload(cfg.webhook, cfg.platform, sample_final,
+                              cfg.custom_ctype, cfg.custom_body,
+                              sample_payload, sizeof(sample_payload),
+                              sample_ctype, sizeof(sample_ctype)) < 0) {
+        safe_copy(sample_ctype, sizeof(sample_ctype), "-");
+        safe_copy(sample_payload, sizeof(sample_payload),
+                  "无法生成 Payload：请检查平台、Webhook 或自定义模板。");
+    }
+    snprintf(sample_preview, sizeof(sample_preview),
+             "最终文本:\n%s\n\nContent-Type:\n%s\n\nPayload:\n%s",
+             sample_final, sample_ctype, sample_payload);
+    html_escape(sample_preview_esc, sizeof(sample_preview_esc), sample_preview);
     port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
     append_page_start(body, WEB_BODY_MAX, "config", "配置",
-                      "保存 webhook、手机号和推送文本前后缀", message);
+                      "保存 webhook、手机号、推送文本和平台", message);
     buf_append(body, WEB_BODY_MAX,
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">WebUI 设置</div></div><div class=\"pad\">"
         "<form method=\"post\" action=\"/set_port\">"
         "<label>WebUI 端口</label><input name=\"port\" value=\"%d\" inputmode=\"numeric\" pattern=\"[0-9]*\" required>"
         "<div class=\"actions\"><button type=\"submit\">保存并切换端口</button></div>"
-        "</form><div class=\"hint\">端口默认保存到 " DEFAULT_CONFIG_PATH "。修改后 WebUI 会立即切换到新端口；ADB 访问需要重新映射新端口。</div>"
+        "</form><div class=\"hint\">端口默认保存到 " DEFAULT_CONFIG_PATH "。修改后 WebUI 会立即切换到新端口。</div>"
         "</div></section>"
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">推送配置</div></div><div class=\"pad\">"
         "<form method=\"post\" action=\"/save_config\">"
-        "<label>推送平台</label><select id=\"platformSelect\" name=\"platform\" onchange=\"toggleCustom()\">"
+        "<label>推送平台</label><select id=\"platformSelect\" name=\"platform\" onchange=\"toggleCustom();updatePreview()\">"
         "<option value=\"dingtalk\"%s>钉钉</option>"
         "<option value=\"feishu\"%s>飞书</option>"
         "<option value=\"wecom\"%s>企业微信</option>"
@@ -2441,15 +2212,16 @@ static void render_config(int fd, const char *message) {
         "<option value=\"bark\"%s>Bark</option>"
         "<option value=\"custom\"%s>自定义</option>"
         "</select>"
-        "<label>Webhook URL</label><textarea name=\"webhook\" required>%s</textarea>"
+        "<label>Webhook URL</label><textarea id=\"webhookInput\" name=\"webhook\" required oninput=\"updatePreview()\">%s</textarea>"
         "<div id=\"customFields\" class=\"custombox\">"
-        "<label>自定义 Content-Type</label><input name=\"custom_ctype\" value=\"%s\">"
-        "<label>自定义消息体模板</label><textarea name=\"custom_body\" rows=\"8\">%s</textarea>"
+        "<label>自定义 Content-Type</label><input id=\"ctypeInput\" name=\"custom_ctype\" value=\"%s\" oninput=\"updatePreview()\">"
+        "<label>自定义消息体模板</label><textarea id=\"customBodyInput\" name=\"custom_body\" rows=\"8\" oninput=\"updatePreview()\">%s</textarea>"
         "<div class=\"hint\">占位符：{{json_text}} 适合 JSON 字符串，{{url_text}} 适合表单或 URL 编码，{{text}} 为原文。</div>"
         "</div>"
-        "<label>设备手机号，可留空自动读取 nv show</label><div class=\"fieldrow\"><input id=\"numInput\" name=\"num\" value=\"%s\"><button class=\"alt\" type=\"button\" onclick=\"fetchMsisdn(this)\">获取</button></div><div id=\"numMsg\" class=\"hint\">获取不到时可手动填写，也可以留空。</div>"
-        "<label>消息前缀</label><input name=\"headtxt\" value=\"%s\">"
-        "<label>消息后缀</label><input name=\"tailtxt\" value=\"%s\">"
+        "<label>设备手机号，可留空自动读取 nv show</label><div class=\"fieldrow\"><input id=\"numInput\" name=\"num\" value=\"%s\" oninput=\"updatePreview()\"><button class=\"alt\" type=\"button\" onclick=\"fetchMsisdn(this)\">获取</button></div><div id=\"numMsg\" class=\"hint\">获取不到时可手动填写，也可以留空。</div>"
+        "<label>消息前缀</label><textarea id=\"headInput\" name=\"headtxt\" rows=\"3\" oninput=\"updatePreview()\">%s</textarea>"
+        "<label>消息后缀</label><textarea id=\"tailInput\" name=\"tailtxt\" rows=\"3\" oninput=\"updatePreview()\">%s</textarea>"
+        "<label>发送内容示例（按当前平台编码）</label><div id=\"msgPreview\" class=\"preview\">%s</div>"
         "<div class=\"actions\"><button type=\"submit\">保存配置</button></div>"
         "</form><div class=\"hint\">配置保存到 " DEFAULT_CONFIG_PATH "，权限 0600。</div></div></section>"
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">Webhook 模板</div></div><div class=\"pad templates\">"
@@ -2471,7 +2243,8 @@ static void render_config(int fd, const char *message) {
         selected_attr(cfg.platform, "telegram"),
         selected_attr(cfg.platform, "bark"),
         selected_attr(cfg.platform, "custom"),
-        webhook, custom_ctype, custom_body, num, head, tail);
+        webhook, custom_ctype, custom_body, num,
+        head, tail, sample_preview_esc);
     append_page_end(body, WEB_BODY_MAX);
     http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
     free(custom_body);
@@ -2608,8 +2381,6 @@ static void handle_save_config(int fd, const char *body) {
         safe_copy(cfg.custom_ctype, sizeof(cfg.custom_ctype),
                   "application/json;charset=utf-8");
     remove_newlines(cfg.num);
-    remove_newlines(cfg.headtxt);
-    remove_newlines(cfg.tailtxt);
     if (!cfg.webhook[0]) {
         render_config(fd, "Webhook 不能为空。");
         return;
@@ -2656,7 +2427,7 @@ static void handle_set_port(int fd, const char *body) {
         ".box{max-width:560px;margin:12vh auto;padding:22px;background:#fff;border:1px solid #d9e5dc;border-radius:8px;box-shadow:0 8px 24px rgba(24,37,29,.06)}"
         ".h{font-size:22px;font-weight:800}.p{color:#55685c;line-height:1.7}.a{display:inline-block;margin-top:10px;color:#1f6d42;font-weight:800}</style>"
         "</head><body><div class=\"box\"><div class=\"h\">WebUI 端口已保存</div>"
-        "<div class=\"p\">服务正在切换到 %d 端口。ADB 访问时请重新映射新端口，然后打开新地址。</div>"
+        "<div class=\"p\">服务正在切换到 %d 端口。请打开新地址继续访问。</div>"
         "<a class=\"a\" href=\"http://127.0.0.1:%d/\">http://127.0.0.1:%d/</a>"
         "</div></body></html>",
         port, port, port);
@@ -2718,13 +2489,17 @@ static int run_test_message(const char *self_path, const web_config_t *cfg,
                             const char *txt) {
     pid_t pid;
     int status = 0;
+    char final_txt[2048];
+
+    build_push_message(final_txt, sizeof(final_txt),
+                       cfg->headtxt, txt, cfg->tailtxt);
 
     pid = fork();
     if (pid < 0)
         return -1;
     if (pid == 0) {
         char url_arg[1200];
-        char txt_arg[1400];
+        char txt_arg[2300];
         char platform_arg[80];
         char custom_ctype_arg[180];
         char custom_body_arg[2300];
@@ -2745,7 +2520,7 @@ static int run_test_message(const char *self_path, const web_config_t *cfg,
                  "--custom-ctype=%s", cfg->custom_ctype);
         snprintf(custom_body_arg, sizeof(custom_body_arg),
                  "--custom-body=%s", cfg->custom_body);
-        snprintf(txt_arg, sizeof(txt_arg), "--txt=%s", txt);
+        snprintf(txt_arg, sizeof(txt_arg), "--txt=%s", final_txt);
         args[n++] = (char *)self_path;
         args[n++] = "--mode=send_once";
         args[n++] = url_arg;
@@ -2916,13 +2691,10 @@ static int run_webui(const char *self_path, int port) {
 
 int main(int argc, char *argv[]) {
     int only_service_mode = 0;
-    int only_strace_mode = 0;
-    int only_rerun_mode = 0;
     int only_send_once_mode = 0;
     int webui_mode = 0;
     int webui_port = DEFAULT_WEBUI_PORT;
     web_config_t saved_cfg;
-    char *headtxt = NULL, *tailtxt = NULL;
     char *manual_msisdn = NULL;
     char *cli_platform = NULL;
     char *cli_custom_ctype = NULL;
@@ -2930,6 +2702,8 @@ int main(int argc, char *argv[]) {
     char *cli_url = NULL;
     char *cli_msgtype = NULL;
     char *cli_txt = NULL;
+    char *cli_headtxt = NULL;
+    char *cli_tailtxt = NULL;
     int i;
 
     load_web_config(&saved_cfg);
@@ -2946,23 +2720,11 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--port=", 7) == 0) {
             webui_port = atoi(argv[i] + 7);
         }
-        if ((strcmp(argv[i], "--mode=strace_zte_mifi") == 0)) {
-            only_strace_mode = 1;
-        }
-        if ((strcmp(argv[i], "--mode=re-run-strace_zte_mifi") == 0)) {
-            only_rerun_mode = 1;
-        }
         if ((strcmp(argv[i], "--mode=service_start") == 0)) {
             only_service_mode = 1;
         }
         if ((strcmp(argv[i], "--mode=send_once") == 0)) { // 新增
             only_send_once_mode = 1;
-        }
-        if (strncmp(argv[i], "--headtxt=", 10) == 0) {
-            headtxt = argv[i] + 10;
-        }
-        if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
-            tailtxt = argv[i] + 10;
         }
         if (strncmp(argv[i], "--num=", 6) == 0) {
             manual_msisdn = argv[i] + 6;
@@ -2985,22 +2747,19 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--txt=", 6) == 0) {
             cli_txt = argv[i] + 6;
         }
+        if (strncmp(argv[i], "--headtxt=", 10) == 0) {
+            cli_headtxt = argv[i] + 10;
+        }
+        if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
+            cli_tailtxt = argv[i] + 10;
+        }
     }
     if (webui_mode) {
         char self_path[512];
         resolve_self_path(self_path, sizeof(self_path), argv[0]);
         return run_webui(self_path, webui_port);
     }
-    if (only_strace_mode && argc == 2) {
-        trace_zte_mifi();
-        return 0;
-    }
-    if (only_rerun_mode && argc == 2) {
-        rerun_strace_zte_mifi();
-        return 0;
-    }
     if (only_service_mode) {
-        service_start_time = time(NULL);
         const char *platform;
         if (!cli_url || strlen(cli_url) == 0) {
             fprintf(stderr, "Error: --mode=service_start 时必须指定 --url=<webhook_url> 参数！\n");
@@ -3030,7 +2789,7 @@ int main(int argc, char *argv[]) {
         }
         char* pdu_args[6] = {
             cli_url, (char *)platform, cli_custom_ctype, cli_custom_body,
-            headtxt, tailtxt
+            cli_headtxt, cli_tailtxt
         };
         if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func, pdu_args) != 0) {
             perror("Failed to create PDU thread");
@@ -3042,8 +2801,9 @@ int main(int argc, char *argv[]) {
     }
     if (only_send_once_mode || cli_url || cli_txt) {
         const char *platform;
+        char final_txt[2048];
         if (!cli_url || !cli_msgtype || !cli_txt) {
-            fprintf(stderr, "Usage: %s --mode=send_once --url=<webhook_url> --platform=<dingtalk|feishu|wecom|serverchan|discord|telegram|bark|custom> [--custom-ctype=<content-type>] [--custom-body=<template>] --msgtype=text --txt=<content>\n", argv[0]);
+            fprintf(stderr, "Usage: %s --mode=send_once --url=<webhook_url> --platform=<dingtalk|feishu|wecom|serverchan|discord|telegram|bark|custom> [--custom-ctype=<content-type>] [--custom-body=<template>] [--headtxt=<prefix>] [--tailtxt=<suffix>] --msgtype=text --txt=<content>\n", argv[0]);
             return 1;
         }
         if (strcmp(cli_msgtype, "text") != 0) {
@@ -3053,10 +2813,12 @@ int main(int argc, char *argv[]) {
         platform = normalize_platform(cli_platform && cli_platform[0] ?
                                       cli_platform :
                                       detect_platform_from_url(cli_url));
-        return send_webhook_msg(cli_url, platform, cli_txt,
+        build_push_message(final_txt, sizeof(final_txt),
+                           cli_headtxt, cli_txt, cli_tailtxt);
+        return send_webhook_msg(cli_url, platform, final_txt,
                                 cli_custom_ctype, cli_custom_body) == 0 ? 0 : 1;
     }
 
-    fprintf(stderr, "Usage: %s -w | --mode=send_once --url=<webhook_url> --platform=<dingtalk|feishu|wecom|serverchan|discord|telegram|bark|custom> [--custom-ctype=<content-type>] [--custom-body=<template>] --msgtype=text --txt=<content>\n", argv[0]);
+    fprintf(stderr, "Usage: %s -w | --mode=send_once --url=<webhook_url> --platform=<dingtalk|feishu|wecom|serverchan|discord|telegram|bark|custom> [--custom-ctype=<content-type>] [--custom-body=<template>] [--headtxt=<prefix>] [--tailtxt=<suffix>] --msgtype=text --txt=<content>\n", argv[0]);
     return 1;
 }
