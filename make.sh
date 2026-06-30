@@ -1,85 +1,85 @@
-#!/bin/bash
+#!/bin/sh
+set -eu
 
-# 设置交叉编译工具链（当前目录的toolchain）
-export CROSS_COMPILE=$(pwd)/toolchain/host/usr/bin/arm-buildroot-linux-uclibcgnueabi-
-export CC=${CROSS_COMPILE}gcc
-export STRIP=${CROSS_COMPILE}strip
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TOOLCHAIN_DIR="$ROOT_DIR/toolchain/host/usr/bin"
+CROSS_PREFIX="$TOOLCHAIN_DIR/arm-buildroot-linux-uclibcgnueabi-"
+CC="${CC:-${CROSS_PREFIX}gcc}"
+STRIP="${STRIP:-${CROSS_PREFIX}strip}"
+CFLAGS="${CFLAGS:--Os -ffunction-sections -fdata-sections}"
+LDFLAGS="${LDFLAGS:--Wl,--gc-sections}"
+MBEDTLS_DIR="$ROOT_DIR/lib-src/mbedtls-2.1.14"
+SRC_FILE="$ROOT_DIR/src/alice-sms-pusher.c"
+BUILD_DIR="$ROOT_DIR/.build"
+OUTPUT_DIR="$ROOT_DIR/output"
+TARGET="$OUTPUT_DIR/alice-pusher-bot"
+TARGET_RUN="$OUTPUT_DIR/alice-pusher-bot.run"
+EMBED_ASSET="$ROOT_DIR/tools/embed_asset.py"
+SELF_EXTRACT="$ROOT_DIR/tools/make_self_extract.sh"
+AVATAR_SRC="$ROOT_DIR/pic/miku_compressed.jpg"
+SPONSOR_SRC="$ROOT_DIR/pic/sponsor_clean.jpg"
 
-export CFLAGS="-Os -ffunction-sections -fdata-sections"
-export LDFLAGS="-Wl,--gc-sections"
+need_file() {
+	if [ ! -f "$1" ]; then
+		echo "错误：缺少文件: $1" >&2
+		exit 1
+	fi
+}
 
-# 设置mbedtls库目录（当前目录的lib-src/mbedtls-2.1.14）
-MBEDTLS_DIR=$(pwd)/lib-src/mbedtls-2.1.14
+need_exec() {
+	if [ ! -x "$1" ]; then
+		echo "错误：缺少可执行文件: $1" >&2
+		exit 1
+	fi
+}
 
-# 检查mbedtls目录是否存在
-if [ ! -d "${MBEDTLS_DIR}" ]; then
-    echo "错误：mbedtls目录不存在: ${MBEDTLS_DIR}"
-    exit 1
-fi
+build_mbedtls_if_needed() {
+	if [ -f "$MBEDTLS_DIR/library/libmbedtls.a" ] &&
+	   [ -f "$MBEDTLS_DIR/library/libmbedx509.a" ] &&
+	   [ -f "$MBEDTLS_DIR/library/libmbedcrypto.a" ]; then
+		return
+	fi
 
-# 设置源文件路径（当前目录的src/alice-pusher-bot.c）
-SRC_FILE=$(pwd)/src/alice-pusher-bot.c
+	if ! command -v cmake >/dev/null 2>&1; then
+		echo "错误：mbedtls 静态库不存在，且当前环境没有 cmake，无法重建库。" >&2
+		exit 1
+	fi
 
-# 检查源文件是否存在
-if [ ! -f "${SRC_FILE}" ]; then
-    echo "错误：源文件不存在: ${SRC_FILE}"
-    exit 1
-fi
+	(
+		cd "$MBEDTLS_DIR"
+		rm -rf CMakeCache.txt CMakeFiles
+		cmake -DCMAKE_C_COMPILER="$CC" \
+			-DCMAKE_C_FLAGS="$CFLAGS" \
+			-DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
+			-DUSE_SHARED_MBEDTLS_LIBRARY=OFF \
+			-DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+			-DMBEDTLS_BUILD_TESTS=OFF \
+			-DMBEDTLS_BUILD_PROGRAMS=OFF \
+			.
+		make -j"$(nproc)"
+	)
+}
 
-# 设置输出目录
-OUTPUT_DIR=$(pwd)/output
-mkdir -p ${OUTPUT_DIR}
+need_exec "$CC"
+need_exec "$STRIP"
+need_file "$SRC_FILE"
+need_file "$EMBED_ASSET"
+need_file "$SELF_EXTRACT"
+need_file "$AVATAR_SRC"
+need_file "$SPONSOR_SRC"
+need_file "$MBEDTLS_DIR/include/mbedtls/ssl.h"
 
-# 进入mbedtls目录进行编译（只编译不安装）
-cd "${MBEDTLS_DIR}"
+mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+python3 "$EMBED_ASSET" "$AVATAR_SRC" "$BUILD_DIR/avatar_asset.h" avatar_image image/jpeg
+python3 "$EMBED_ASSET" "$SPONSOR_SRC" "$BUILD_DIR/sponsor_asset.h" sponsor_image image/jpeg
 
-# 清理之前的构建
-make clean 2>/dev/null
-rm -rf CMakeCache.txt CMakeFiles
+build_mbedtls_if_needed
 
-# 配置mbedtls，禁用不必要的功能以减小体积
-if [ -f "CMakeLists.txt" ]; then
-    # 使用CMake配置
-    cmake -DCMAKE_C_COMPILER="${CC}" \
-          -DCMAKE_C_FLAGS="${CFLAGS}" \
-          -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-          -DUSE_SHARED_MBEDTLS_LIBRARY=OFF \
-          -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
-          -DMBEDTLS_BUILD_TESTS=OFF \
-          -DMBEDTLS_BUILD_PROGRAMS=OFF \
-          .
-elif [ -f "configure" ]; then
-    # 使用autotools配置
-    ./configure --host=arm-buildroot-linux-uclibcgnueabi \
-                --disable-shared \
-                --enable-static \
-                --disable-tests \
-                --disable-programs \
-                CFLAGS="${CFLAGS}" \
-                LDFLAGS="${LDFLAGS}"
-else
-    echo "错误：无法识别mbedtls的构建系统"
-    exit 1
-fi
+"$CC" $CFLAGS -I"$MBEDTLS_DIR/include" "$SRC_FILE" -o "$TARGET" \
+	$LDFLAGS -L"$MBEDTLS_DIR/library" \
+	-lmbedtls -lmbedx509 -lmbedcrypto -pthread
+"$STRIP" --strip-all "$TARGET"
+"$SELF_EXTRACT" "$TARGET" "$TARGET_RUN"
 
-# 编译mbedtls
-make -j$(nproc)
-
-# 返回原目录
-cd ..
-
-# 编译指定的C文件，使用优化选项
-${CC} ${CFLAGS} -I${MBEDTLS_DIR}/include ${SRC_FILE} -o ${OUTPUT_DIR}/alice-pusher-bot \
-    ${LDFLAGS} -L${MBEDTLS_DIR}/library -lmbedtls -lmbedx509 -lmbedcrypto -pthread
-
-# 检查是否生成了可执行文件
-if [ -f "${OUTPUT_DIR}/alice-pusher-bot" ]; then
-    # 使用strip移除符号表和调试信息
-    ${STRIP} --strip-all ${OUTPUT_DIR}/alice-pusher-bot
-    echo "编译完成！"
-    echo "可执行文件位置: ${OUTPUT_DIR}/alice-pusher-bot"
-    echo "优化后文件大小: $(du -h ${OUTPUT_DIR}/alice-pusher-bot | cut -f1)"
-else
-    echo "编译失败：未能生成可执行文件"
-    exit 1
-fi
+echo "构建完成："
+ls -lh "$TARGET" "$TARGET_RUN"

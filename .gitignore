@@ -1,0 +1,11 @@
+/.build/
+*.log
+*.pid
+*.out
+*.err
+*.tmp
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

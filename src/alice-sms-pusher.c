@@ -14,294 +14,297 @@
 #include <mbedtls/version.h>
 #include <pthread.h>
 #include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
+#include <limits.h>
+#include "../.build/avatar_asset.h"
+#include "../.build/sponsor_asset.h"
 
 #define MAX_BUFFER_LEN 4096
+#define DEFAULT_WEBUI_PORT 51401
+#define DEFAULT_CONFIG_PATH "/mnt/userdata/etc_rw/alice_pusher.conf"
+#define DEFAULT_SERVICE_PID "/tmp/alice_pusher_service.pid"
+#define DEFAULT_LOG_PATH "/tmp/alice_pusher.log"
+#define DEFAULT_RUN_PATH "/mnt/userdata/alice-pusher-bot.run"
+#define DEFAULT_BIN_PATH "/mnt/userdata/alice-pusher-bot"
+#define DEFAULT_AUTOSTART_SCRIPT "/mnt/userdata/alice_pusher_autostart.sh"
+#define DEFAULT_AUTOSTART_RC "/etc/rc"
+#define AUTOSTART_BEGIN "# alice-pusher-bot autostart begin"
+#define AUTOSTART_END "# alice-pusher-bot autostart end"
+#define WEB_BODY_MAX 65536
+#define WEB_REQ_MAX 16384
+#define LOG_TAIL_MAX 32768
 
-// 用于限制PDU的最大长度
-#define MAX_PDU_LENGTH 2048
+static int g_webui_port = DEFAULT_WEBUI_PORT;
+static volatile sig_atomic_t g_webui_restart_requested;
+static int g_webui_restart_port;
 
-// 添加连续检测结构体
-typedef struct {
-    char sender[64];
-    char timestamp[64];
-    char text[1024];
-    int count;
-    time_t last_seen;
-} sms_detection_t;
-
-#define DETECTION_WINDOW_SIZE 10
-// 修复拼写错误：DEECTION_WINDOW_SIZE -> DETECTION_WINDOW_SIZE
-static sms_detection_t detection_window[DETECTION_WINDOW_SIZE];
-static int detection_head = 0;
-static int detection_count = 0;
-// 接收短信状态变量
-static volatile int sms_receiving = 0;  // 标记是否正在接收短信
-static time_t last_sms_activity = 0;    // 上次短信活动时间
-
-// SIM卡号相关全局变量
-static char global_sim_number[32] = {0};
-static int sim_number_initialized = 0;
-
-// 添加PDU片段队列结构体
-typedef struct {
-    char sender[64];
-    char timestamp[64];
-    char pdu_fragment[2048];
-    time_t received_time;
-} pdu_fragment_t;
-
-#define PDU_FRAGMENT_QUEUE_SIZE 20
-static pdu_fragment_t pdu_fragment_queue[PDU_FRAGMENT_QUEUE_SIZE];
-static int pdu_fragment_head = 0;
-static int pdu_fragment_count = 0;
-
-// 添加长短信片段结构体
-typedef struct {
-    char sender[64];
-    char timestamp[64];
-    unsigned char ref;      // 参考编号
-    unsigned char max;      // 总片段数
-    unsigned char seq;      // 当前片段序号
-    char text[2048];        // 片段文本内容
-    time_t received_time;   // 接收时间
-    char pdu[2048];         // 片段PDU内容
-} long_sms_fragment_t;
-
-#define LONG_SMS_FRAGMENT_QUEUE_SIZE 50
-static long_sms_fragment_t long_sms_fragment_queue[LONG_SMS_FRAGMENT_QUEUE_SIZE];
-static int long_sms_fragment_head = 0;
-static int long_sms_fragment_count = 0;
-
-// 添加长短信跟踪结构体
-typedef struct {
-    char sender[64];
-    char timestamp[64];
-    time_t first_seen;
-} long_sms_tracker_t;
-
-#define LONG_SMS_TRACKER_SIZE 20
-static long_sms_tracker_t long_sms_tracker[LONG_SMS_TRACKER_SIZE];
-static int long_sms_tracker_count = 0;
-
-// 添加临时存储结构体，用于5秒周期检测
-typedef struct {
-    char sender[64];
-    char timestamp[64];
-    char text[8192];
-    char pdu_list[10][2048]; // 存储最多10个PDU片段
-    int pdu_count;
-    time_t first_received;
-    time_t last_received;
-} temp_sms_storage_t;
-
-#define TEMP_SMS_STORAGE_SIZE 20
-static temp_sms_storage_t temp_sms_storage[TEMP_SMS_STORAGE_SIZE];
-static int temp_sms_storage_count = 0;
 
 // 函数声明
 static pid_t get_strace_pid_from_file(void);
 static void set_strace_pid_to_file(pid_t pid);
 void extract_write_lines_from_log(void);
 void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen);
-void send_dingtalk_msg(const char *webhook, const char *txt, const char *keyword);
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword, const char *number);
+int send_webhook_msg(const char *webhook, const char *platform,
+                     const char *txt, const char *custom_ctype,
+                     const char *custom_body);
+void send_dingtalk_msg(const char *webhook, const char *txt);
+void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt);
 void print_mbedtls_error(int ret, const char *msg);
 void parse_url(const char *url, char **host, char **path);
 void signal_handler(int sig);
 int find_zte_mifi_pid(void);
-char* get_sim_number_from_nv(void);
-void init_sim_number(void);
-char* filter_garbage_chars(const char *text);
+void trace_zte_mifi(void);
+void rerun_strace_zte_mifi(void);
+static int run_webui(const char *self_path, int port);
+static void json_escape(char *out, size_t outsz, const char *in);
+static void safe_copy(char *dst, size_t dstsz, const char *src);
 
 // 线程控制变量
 static volatile int threads_running = 1;
 static pthread_t strace_thread_id;
 static pthread_t pdu_thread_id;
-static pid_t monitor_pid = -1;
-static void set_monitor_pid(pid_t pid) {
-    monitor_pid = pid;
+
+static void process_strace_line_for_sms(const char *line, const char *webhook,
+                                        const char *platform,
+                                        const char *custom_ctype,
+                                        const char *custom_body,
+                                        const char *headtxt,
+                                        const char *tailtxt);
+
+typedef struct {
+    char lines[256][MAX_BUFFER_LEN];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} strace_line_queue_t;
+
+static strace_line_queue_t g_strace_queue = {
+    .head = 0,
+    .tail = 0,
+    .count = 0,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER
+};
+
+static void strace_queue_push_line(const char *line) {
+    pthread_mutex_lock(&g_strace_queue.mutex);
+    if (g_strace_queue.count == (int)(sizeof(g_strace_queue.lines) / sizeof(g_strace_queue.lines[0]))) {
+        g_strace_queue.head = (g_strace_queue.head + 1) % (int)(sizeof(g_strace_queue.lines) / sizeof(g_strace_queue.lines[0]));
+        g_strace_queue.count--;
+    }
+    strncpy(g_strace_queue.lines[g_strace_queue.tail], line, MAX_BUFFER_LEN - 1);
+    g_strace_queue.lines[g_strace_queue.tail][MAX_BUFFER_LEN - 1] = 0;
+    g_strace_queue.tail = (g_strace_queue.tail + 1) % (int)(sizeof(g_strace_queue.lines) / sizeof(g_strace_queue.lines[0]));
+    g_strace_queue.count++;
+    pthread_cond_signal(&g_strace_queue.cond);
+    pthread_mutex_unlock(&g_strace_queue.mutex);
 }
 
-// 添加全局变量存储完整的zte_mifi和zte_ufi路径
-static char zte_mifi_path[256] = "/sbin/zte_mifi";
-static char zte_ufi_path[256] = "/sbin/zte_ufi";
-// 添加strace路径变量
-static char strace_bin_path[256] = "/sbin/strace";
-
-// 添加用于动态调整重启间隔的变量
-static time_t last_sms_detected_time = 0;       // 上次检测到短信的时间
-static const int BASE_RESTART_INTERVAL = 60;    // 基础重启间隔(秒)
-static const int MAX_RESTART_INTERVAL = 180;     // 最大重启间隔(秒)
-static const int INTERVAL_EXTENSION = 5;        // 每次检测到短信时的延长时间(秒)
-
-// 替换原有的filter_garbage_chars函数为以下版本：
-char* filter_garbage_chars(const char *text) {
-    if (!text) return NULL;
-    
-    size_t len = strlen(text);
-    if (len == 0) return strdup(""); // 返回空字符串的副本
-    
-    // 分配足够大的缓冲区存储过滤后的文本
-    char *filtered_text = (char*)malloc(len + 1);
-    if (!filtered_text) return NULL;
-    
-    int i, j;
-    for (i = 0, j = 0; text[i] != '\0'; ) {
-        unsigned char c = (unsigned char)text[i];
-        
-        // ASCII字符范围 (0x00-0x7F)
-        if (c <= 0x7F) {
-            // 保留常见的ASCII字符（英语字母、数字、标点符号）
-            if ((c >= 'A' && c <= 'Z') ||    // 大写英文字母
-                (c >= 'a' && c <= 'z') ||    // 小写英文字母
-                (c >= '0' && c <= '9') ||    // 数字
-                c == ' ' || c == '\n' || c == '\r' || c == '\t' ||  // 空格和换行符
-                c == '.' || c == ',' || c == '!' || c == '?' ||     // 常见英语标点
-                c == ';' || c == ':' || c == '\'' || c == '"' ||
-                c == '(' || c == ')' || c == '[' || c == ']' ||
-                c == '{' || c == '}' || c == '-' || c == '_' ||
-                c == '+' || c == '=' || c == '*' || c == '/' ||
-                c == '\\' || c == '|' || c == '<' || c == '>' ||
-                c == '@' || c == '#' || c == '$' || c == '%' ||
-                c == '^' || c == '&' || c == '~' || c == '`') {
-                filtered_text[j++] = c;
-            }
-            // 其他ASCII字符将被过滤掉（替换为空）
-            i++;
-            continue;
-        }
-        
-        // UTF-8多字节字符处理
-        // 检查是否是完整的UTF-8序列
-        if ((c & 0xE0) == 0xC0) {  // 2字节字符 (U+0080-U+07FF)
-            if (i+1 < (int)len && (text[i+1] & 0xC0) == 0x80) {
-                // 过滤所有2字节字符（包括拉丁扩展等）
-                i += 2;
-            } else {
-                // 不完整序列，跳过
-                i++;
-            }
-            continue;
-        } else if ((c & 0xF0) == 0xE0) {  // 3字节字符 (U+0800-U+FFFF)
-            if (i+2 < (int)len && (text[i+1] & 0xC0) == 0x80 && (text[i+2] & 0xC0) == 0x80) {
-                // 保留常用中文字符和标点:
-                // 中日韩统一汉字 (U+4E00-U+9FFF) 对应UTF-8: 0xE4 0xB8 0x80 - 0xE9 0xBF BF
-                // CJK符号和标点 (U+3000-U+303F) 对应UTF-8: 0xE3 0x80 0x80 - 0xE3 0x80 0xBF
-                // 全角ASCII字符 (U+FF00-U+FFEF) 对应UTF-8: 0xEF 0xBC 0x80 - 0xEF 0xBF 0xAF
-                if ((c == 0xE4 && (unsigned char)text[i+1] >= 0xB8 && (unsigned char)text[i+1] <= 0xBF) ||
-                    (c == 0xE5 || c == 0xE6 || c == 0xE7 || c == 0xE8 || c == 0xE9) ||
-                    (c == 0xE3 && (unsigned char)text[i+1] == 0x80) ||
-                    (c == 0xEF && (unsigned char)text[i+1] >= 0xBC && (unsigned char)text[i+1] <= 0xBF)) {
-                    filtered_text[j++] = c;
-                    filtered_text[j++] = text[i+1];
-                    filtered_text[j++] = text[i+2];
-                    i += 3;
-                } else {
-                    // 过滤其他3字节字符（替换为空）
-                    i += 3;
-                }
-            } else {
-                // 不完整序列，跳过
-                i++;
-            }
-            continue;
-        } else if ((c & 0xF8) == 0xF0) {  // 4字节字符 (U+10000-U+10FFFF)
-            // 过滤所有4字节字符（替换为空）
-            if (i+3 < (int)len && (text[i+1] & 0xC0) == 0x80 && 
-                (text[i+2] & 0xC0) == 0x80 && (text[i+3] & 0xC0) == 0x80) {
-                i += 4;
-            } else {
-                // 不完整序列，跳过
-                i++;
-            }
-            continue;
-        }
-        
-        // 其他字符跳过（替换为空）
-        i++;
+static int strace_queue_pop_line(char *out, size_t outlen, int timeout_ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
     }
-    filtered_text[j] = '\0';
-    
-    // 调整内存大小以适应实际需要
-    char *result = (char*)realloc(filtered_text, j + 1);
-    return result ? result : filtered_text; // 如果realloc失败，返回原始分配的内存
+
+    pthread_mutex_lock(&g_strace_queue.mutex);
+    while (threads_running && g_strace_queue.count == 0) {
+        if (pthread_cond_timedwait(&g_strace_queue.cond, &g_strace_queue.mutex, &ts) == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_strace_queue.mutex);
+            return 0;
+        }
+    }
+    if (!threads_running || g_strace_queue.count == 0) {
+        pthread_mutex_unlock(&g_strace_queue.mutex);
+        return 0;
+    }
+    strncpy(out, g_strace_queue.lines[g_strace_queue.head], outlen - 1);
+    out[outlen - 1] = 0;
+    g_strace_queue.head = (g_strace_queue.head + 1) % (int)(sizeof(g_strace_queue.lines) / sizeof(g_strace_queue.lines[0]));
+    g_strace_queue.count--;
+    pthread_mutex_unlock(&g_strace_queue.mutex);
+    return 1;
 }
 
-// 获取SIM卡号函数
-char* get_sim_number_from_nv(void) {
-    // 使用popen直接读取nv show命令的输出，避免创建临时文件
-    FILE *fp = popen("nv show 2>/dev/null", "r");
-    if (!fp) {
-        return NULL;
-    }
-    
-    char line[512];
-    regex_t regex;
-    regmatch_t matches[2];
-    char *sim_number = NULL;
-    
-    // 编译正则表达式匹配msisdn=+86xxxxxxxxxx格式
-    if (regcomp(&regex, "msisdn=\\+([0-9]+)", REG_EXTENDED) != 0) {
-        pclose(fp);
-        return NULL;
-    }
-    
-    // 逐行读取命令输出查找匹配项
-    while (fgets(line, sizeof(line), fp)) {
-        if (regexec(&regex, line, 2, matches, 0) == 0) {
-            int len = matches[1].rm_eo - matches[1].rm_so;
-            sim_number = (char*)malloc(len + 1);
-            if (sim_number) {
-                strncpy(sim_number, line + matches[1].rm_so, len);
-                sim_number[len] = '\0';
-                break;
-            }
-        }
-    }
-    
-    // 清理资源
-    regfree(&regex);
-    pclose(fp);
-    
-    return sim_number;
+static time_t get_next_midnight_epoch(void) {
+    time_t now = time(NULL);
+    struct tm *tm_now_ptr = localtime(&now);
+    if (!tm_now_ptr) return now + 24 * 3600;
+    struct tm tm_now = *tm_now_ptr;
+    tm_now.tm_hour = 0;
+    tm_now.tm_min = 0;
+    tm_now.tm_sec = 0;
+    time_t today_midnight = mktime(&tm_now);
+    return today_midnight + 24 * 3600;
 }
 
-// 初始化SIM卡号
-void init_sim_number(void) {
-    if (sim_number_initialized) return;
-    
-    char* sim_number = get_sim_number_from_nv();
-    if (sim_number) {
-        if (strlen(sim_number) >= 11 && strlen(sim_number) <= 15) {
-            strncpy(global_sim_number, sim_number, sizeof(global_sim_number) - 1);
-        }
-        free(sim_number);
-    }
-    sim_number_initialized = 1;
-}
+static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *out_read_fd) {
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
 
-// PID文件操作函数实现
-static pid_t get_strace_pid_from_file(void) {
-    FILE *fp = fopen("/tmp/strace_pid.txt", "r");
-    if (!fp) return -1;
-    pid_t pid;
-    if (fscanf(fp, "%d", &pid) != 1) {
-        fclose(fp);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDERR_FILENO);
+        close(fds[1]);
+
+        char pidstr[16];
+        snprintf(pidstr, sizeof(pidstr), "%d", target_pid);
+        execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, (char*)NULL);
+        _exit(127);
+    }
+
+    if (child < 0) {
+        close(fds[0]);
+        close(fds[1]);
         return -1;
     }
+
+    close(fds[1]);
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+    }
+    *out_strace_pid = child;
+    *out_read_fd = fds[0];
+    return 0;
+}
+
+void trace_zte_mifi() {
+    int pid = find_zte_mifi_pid();
+    if (pid <= 0) {
+        fprintf(stderr, "zte_mifi进程未找到\n");
+        return;
+    }
+    while (1) {
+        pid_t strace_pid = 0;
+        int read_fd = -1;
+        if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
+            perror("start_strace_with_pipe");
+            return;
+        }
+        set_strace_pid_to_file(strace_pid);
+        time_t next_midnight = get_next_midnight_epoch();
+
+        char partial[MAX_BUFFER_LEN];
+        size_t partial_len = 0;
+        while (1) {
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = read_fd;
+            pfd.events = POLLIN;
+            int pr = poll(&pfd, 1, 500);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                char buf[1024];
+                ssize_t n = read(read_fd, buf, sizeof(buf));
+                if (n > 0) {
+                    size_t i;
+                    for (i = 0; i < (size_t)n; i++) {
+                        char c = buf[i];
+                        if (partial_len + 1 < sizeof(partial)) {
+                            partial[partial_len++] = c;
+                        }
+                        if (c == '\n') {
+                            partial[partial_len] = 0;
+                            fputs(partial, stdout);
+                            partial_len = 0;
+                        }
+                        if (partial_len + 1 >= sizeof(partial)) {
+                            partial[partial_len] = 0;
+                            fputs(partial, stdout);
+                            partial_len = 0;
+                        }
+                    }
+                } else if (n == 0) {
+                    break;
+                } else {
+                    if (errno != EAGAIN && errno != EINTR) break;
+                }
+            }
+            time_t now = time(NULL);
+            if (now >= next_midnight) {
+                kill(strace_pid, SIGTERM);
+                int wait_count = 0;
+                while (wait_count < 10) {
+                    if (kill(strace_pid, 0) != 0) break;
+                    usleep(100*1000);
+                    wait_count++;
+                }
+                if (kill(strace_pid, 0) == 0) {
+                    kill(strace_pid, SIGKILL);
+                    usleep(200*1000);
+                }
+                int ztepid = find_zte_mifi_pid();
+                if (ztepid > 0) kill(ztepid, SIGCONT);
+                break;
+            }
+            int status = 0;
+            pid_t w = waitpid(strace_pid, &status, WNOHANG);
+            if (w == strace_pid) break;
+        }
+        close(read_fd);
+        waitpid(strace_pid, NULL, 0);
+        pid = find_zte_mifi_pid();
+        if (pid <= 0) return;
+    }
+}
+
+// 用文件记录strace子进程pid，便于跨进程kill
+static pid_t get_strace_pid_from_file() {
+    FILE *fp = fopen("/tmp/zte_strace.pid", "r");
+    if (!fp) return 0;
+    pid_t pid = 0;
+    fscanf(fp, "%d", &pid);
     fclose(fp);
     return pid;
 }
-
 static void set_strace_pid_to_file(pid_t pid) {
-    FILE *fp = fopen("/tmp/strace_pid.txt", "w");
-    if (!fp) return;
-    fprintf(fp, "%d", pid);
-    fclose(fp);
+    FILE *fp = fopen("/tmp/zte_strace.pid", "w");
+    if (fp) {
+        fprintf(fp, "%d", pid);
+        fclose(fp);
+    }
 }
 
-// 查找指定路径的zte_mifi或zte_ufi进程 pid，返回第一个找到的 pid，找不到返回 -1
+// 立即清空 /tmp/zte_log.txt 并重启 strace 跟踪（优雅kill，保护zte_mifi）
+void rerun_strace_zte_mifi() {
+    pid_t oldpid = get_strace_pid_from_file();
+    if (oldpid > 0) {
+        // 优先SIGTERM优雅退出
+        kill(oldpid, SIGTERM);
+        int wait_count = 0;
+        while (wait_count < 10) { // 最多等1秒
+            if (kill(oldpid, 0) != 0) break; // 已退出
+            usleep(100*1000);
+            wait_count++;
+        }
+        // 若还在则SIGKILL
+        if (kill(oldpid, 0) == 0) {
+            kill(oldpid, SIGKILL);
+            usleep(200*1000);
+        }
+        // 杀完strace后，给zte_mifi发SIGCONT，防止其被挂起
+        int ztepid = find_zte_mifi_pid();
+        if (ztepid > 0) {
+            kill(ztepid, SIGCONT);
+        }
+    }
+}
+
+// 查找 /sbin/zte_mifi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
 int find_zte_mifi_pid() {
     DIR *dir;
     struct dirent *entry;
@@ -318,8 +321,7 @@ int find_zte_mifi_pid() {
         ssize_t len = readlink(path, buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
-            // 检查是否匹配指定的完整路径
-            if (strcmp(buf, zte_mifi_path) == 0 || strcmp(buf, zte_ufi_path) == 0) {
+            if (strcmp(buf, "/sbin/zte_mifi") == 0) {
                 pid = id;
                 break;
             }
@@ -329,371 +331,119 @@ int find_zte_mifi_pid() {
     return pid;
 }
 
-// 添加长短信到跟踪器
-void add_long_sms_to_tracker(const char *sender, const char *timestamp) {
-    // 检查是否已存在
-    int i;
-    for (i = 0; i < long_sms_tracker_count; i++) {
-        if (strcmp(long_sms_tracker[i].sender, sender) == 0 &&
-            strcmp(long_sms_tracker[i].timestamp, timestamp) == 0) {
-            // 更新时间
-            long_sms_tracker[i].first_seen = time(NULL);
-            return; // 已存在，不需要重复添加
-        }
-    }
-    
-    // 添加新的长短信跟踪项
-    if (long_sms_tracker_count < LONG_SMS_TRACKER_SIZE) {
-        strncpy(long_sms_tracker[long_sms_tracker_count].sender, sender, sizeof(long_sms_tracker[0].sender) - 1);
-        long_sms_tracker[long_sms_tracker_count].sender[sizeof(long_sms_tracker[0].sender) - 1] = '\0';
-        
-        strncpy(long_sms_tracker[long_sms_tracker_count].timestamp, timestamp, sizeof(long_sms_tracker[0].timestamp) - 1);
-        long_sms_tracker[long_sms_tracker_count].timestamp[sizeof(long_sms_tracker[0].timestamp) - 1] = '\0';
-        
-        long_sms_tracker[long_sms_tracker_count].first_seen = time(NULL);
-        long_sms_tracker_count++;
-    }
-}
-
-// 检查是否是已知长短信的片段
-int is_known_long_sms(const char *sender, const char *timestamp) {
-    int i;
-    for (i = 0; i < long_sms_tracker_count; i++) {
-        // 检查发件人和时间戳是否匹配
-        if (strcmp(long_sms_tracker[i].sender, sender) == 0 &&
-            strcmp(long_sms_tracker[i].timestamp, timestamp) == 0) {
-            // 检查是否过期（1分钟内认为是同一短信）
-            if (time(NULL) - long_sms_tracker[i].first_seen < 60) {
-                return 1; // 是已知长短信
-            } else {
-                // 过期了，移除该项
-                int j;  
-                for (j = i; j < long_sms_tracker_count - 1; j++) {
-                    long_sms_tracker[j] = long_sms_tracker[j + 1];
-                }
-                long_sms_tracker_count--;
-            }
-        }
-    }
-    return 0; // 不是已知长短信
-}
-
-// 清理过期的长短信跟踪项
-void cleanup_long_sms_tracker() {
-    time_t now = time(NULL);
-    int i = 0;
-    while (i < long_sms_tracker_count) {
-        if (now - long_sms_tracker[i].first_seen > 60) { // 60秒过期
-            // 移动后续项向前
-            int j;
-            for (j = i; j < long_sms_tracker_count - 1; j++) {
-                long_sms_tracker[j] = long_sms_tracker[j + 1];
-            }
-            long_sms_tracker_count--;
-        } else {
-            i++;
-        }
-    }
-}
-
-// 修改strace_thread_func函数中的重启周期相关常量和逻辑
+// strace线程函数 - 执行 strace 跟踪 zte_mifi 进程的 read/write 系统调用
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
-    
-    int pid = find_zte_mifi_pid();
-    if (pid <= 0) {
-        fprintf(stderr, "zte_mifi进程未找到\n");
-        return NULL;
-    }
-    pid_t child = fork();
-    if (child == 0) {
-        char pidstr[16];
-        snprintf(pidstr, sizeof(pidstr), "%d", pid);
-        // 修改为跟踪write系统调用
-        execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
-        _exit(127);
-    } else if (child > 0) {
-        set_strace_pid_to_file(child);
-        // 后台定时任务
-        if (fork() == 0) {
-            const long MAX_LOG_SIZE = 1 * 512 * 1024; // 0.5MB
-            int check_count = 0;
-            time_t last_restart_time = time(NULL);
-            
-            // 修改默认重启周期为1分钟，最大周期为5分钟
-            const int BASE_RESTART_INTERVAL = 60;    // 基础重启间隔(1分钟)
-            const int MAX_RESTART_INTERVAL = 300;    // 最大重启间隔(5分钟)
-            const int INTERVAL_EXTENSION = 10;       // 检测到短信时的延长时间(10秒)
-            
-            while (threads_running) {
-                check_count++;
-                time_t current_time = time(NULL);
-                
-                // 计算当前应该使用的重启间隔
-                int current_restart_interval = BASE_RESTART_INTERVAL;
-                
-                // 检查是否在最近检测到短信
-                if (last_sms_detected_time > 0) {
-                    // 计算从上次检测到短信以来的时间
-                    time_t time_since_last_sms = current_time - last_sms_detected_time;
-                    
-                    // 如果在基础间隔内检测到短信，则延长重启间隔
-                    if (time_since_last_sms < BASE_RESTART_INTERVAL) {
-                        // 根据距离上次短信的时间计算新的间隔
-                        current_restart_interval = BASE_RESTART_INTERVAL + 
-                            (BASE_RESTART_INTERVAL - time_since_last_sms) + INTERVAL_EXTENSION;
-                        
-                        // 确保不超过最大间隔
-                        if (current_restart_interval > MAX_RESTART_INTERVAL) {
-                            current_restart_interval = MAX_RESTART_INTERVAL;
-                        }
-                    }
-                }
-                
-                // 检查是否需要重启strace进程
-                if ((current_time - last_restart_time) >= current_restart_interval) {
-                    // 在重启前检查是否正在接收匹配write(1, ...)格式的短信
-                    int should_delay_restart = 0;
-                    
-                    // 检查/tmp/zte_log.txt中是否存在匹配write(1, ...)格式的短信
-                    FILE *fp = fopen("/tmp/zte_log.txt", "r");
-                    if (fp) {
-                        char line[4096];
-                        regex_t reg;
-                        regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
-                        
-                        while (fgets(line, sizeof(line), fp)) {
-                            if (regexec(&reg, line, 0, NULL, 0) == 0) {
-                                should_delay_restart = 1;
-                                printf("[DEBUG] Found write(1, ...) SMS pattern, will delay strace restart\n");
-                                break;
-                            }
-                        }
-                        regfree(&reg);
-                        fclose(fp);
-                    }
-                    
-                    if (should_delay_restart) {
-                        // 如果检测到匹配的短信，延迟10秒再检查
-                        printf("检测到正在接收匹配的短信(write(1, ...))，延迟10秒重启strace进程...\n");
-                        sleep(10);
-                        
-                        // 再次检查是否仍在接收短信
-                        int still_receiving = 0;
-                        fp = fopen("/tmp/zte_log.txt", "r");
-                        if (fp) {
-                            char line[4096];
-                            regex_t reg;
-                            regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
-                            
-                            while (fgets(line, sizeof(line), fp)) {
-                                if (regexec(&reg, line, 0, NULL, 0) == 0) {
-                                    still_receiving = 1;
-                                    break;
-                                }
-                            }
-                            regfree(&reg);
-                            fclose(fp);
-                        }
-                        
-                        if (still_receiving) {
-                            printf("仍在接收匹配的短信，再延迟10秒重启strace进程...\n");
-                            sleep(10);
-                        }
-                    }
-                    
-                    // 最终检查并重启strace进程
-                    printf("重启strace进程，当前间隔: %d秒...\n", current_restart_interval);
-                    // 重启strace
-                    pid_t oldpid = get_strace_pid_from_file();
-                    if (oldpid > 0) {
-                        kill(oldpid, SIGTERM);
-                        int wait_count = 0;
-                        while (wait_count < 10) {
-                            if (kill(oldpid, 0) != 0) break;
-                            usleep(100*1000);
-                            wait_count++;
-                        }
-                        if (kill(oldpid, 0) == 0) {
-                            kill(oldpid, SIGKILL);
-                            usleep(200*1000);
-                        }
-                        int ztepid = find_zte_mifi_pid();
-                        if (ztepid > 0) {
-                            kill(ztepid, SIGCONT);
-                        }
-                    }
-                    // 使用truncate强制清空文件（0字节填充）
-                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
-                        perror("truncate /tmp/zte_log.txt");
-                    }
-                    int newpid = find_zte_mifi_pid();
-                    if (newpid > 0) {
-                        pid_t c2 = fork();
-                        if (c2 == 0) {
-                            char pidstr2[16];
-                            snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
-                            // 修改为跟踪write系统调用
-                            execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
-                            _exit(127);
-                        } else if (c2 > 0) {
-                            set_strace_pid_to_file(c2);
-                        }
-                    }
-                    last_restart_time = current_time;
-                }
-                
-                // 检查日志文件大小（仍然保留此检查作为额外保护）
-                struct stat st;
-                if (stat("/tmp/zte_log.txt", &st) == 0 && st.st_size > MAX_LOG_SIZE) {
-                    // 文件过大，清空文件而不是重启strace
-                    printf("日志文件过大(%ld bytes)，清空文件\n", st.st_size);
-                    // 使用truncate强制清空文件
-                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
-                        perror("truncate /tmp/zte_log.txt");
-                    }
-                }
-                
-                // 等待1秒或者主线程退出
-                int sec_to_wait = 1;
-                int slept = 0;
-                while (slept < sec_to_wait && threads_running) {
-                    int to_sleep = (sec_to_wait - slept) > 10 ? 10 : (sec_to_wait - slept);
-                    sleep(to_sleep);
-                    slept += to_sleep;
-                }
-                
-                // 如果主线程已退出，则退出循环
-                if (!threads_running) break;
-            }
-            _exit(0);
+
+    while (threads_running) {
+        int pid = find_zte_mifi_pid();
+        if (pid <= 0) {
+            fprintf(stderr, "zte_mifi进程未找到\n");
+            sleep(1);
+            continue;
         }
-        // 添加短暂延迟，避免忙等待
-        usleep(100000); // 0.1秒
-        waitpid(child, NULL, 0);
-    } else {
-        perror("fork");
+
+        pid_t strace_pid = 0;
+        int read_fd = -1;
+        if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
+            perror("start_strace_with_pipe");
+            sleep(1);
+            continue;
+        }
+        set_strace_pid_to_file(strace_pid);
+        time_t next_midnight = get_next_midnight_epoch();
+
+        char partial[MAX_BUFFER_LEN];
+        size_t partial_len = 0;
+        while (threads_running) {
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = read_fd;
+            pfd.events = POLLIN;
+            int pr = poll(&pfd, 1, 200);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                char buf[2048];
+                ssize_t n = read(read_fd, buf, sizeof(buf));
+                if (n > 0) {
+                    size_t i;
+                    for (i = 0; i < (size_t)n; i++) {
+                        char c = buf[i];
+                        if (partial_len + 1 < sizeof(partial)) {
+                            partial[partial_len++] = c;
+                        }
+                        if (c == '\n') {
+                            partial[partial_len] = 0;
+                            strace_queue_push_line(partial);
+                            partial_len = 0;
+                        }
+                        if (partial_len + 1 >= sizeof(partial)) {
+                            partial[partial_len] = 0;
+                            strace_queue_push_line(partial);
+                            partial_len = 0;
+                        }
+                    }
+                } else if (n == 0) {
+                    break;
+                } else {
+                    if (errno != EAGAIN && errno != EINTR) break;
+                }
+            }
+
+            time_t now = time(NULL);
+            if (now >= next_midnight) {
+                kill(strace_pid, SIGTERM);
+                int wait_count = 0;
+                while (wait_count < 10) {
+                    if (kill(strace_pid, 0) != 0) break;
+                    usleep(100*1000);
+                    wait_count++;
+                }
+                if (kill(strace_pid, 0) == 0) {
+                    kill(strace_pid, SIGKILL);
+                    usleep(200*1000);
+                }
+                int ztepid = find_zte_mifi_pid();
+                if (ztepid > 0) {
+                    kill(ztepid, SIGCONT);
+                }
+                break;
+            }
+
+            int status = 0;
+            pid_t w = waitpid(strace_pid, &status, WNOHANG);
+            if (w == strace_pid) break;
+        }
+
+        close(read_fd);
+        waitpid(strace_pid, NULL, 0);
+        if (!threads_running) break;
+        sleep(1);
     }
     return NULL;
 }
 
-// 修改pdu_thread_func函数，只在匹配write(1, ...)格式时更新短信接收状态
+// PDU处理线程函数
 void* pdu_thread_func(void* arg) {
     char** args = (char**)arg;
     char* webhook = args[0];
-    char* headtxt = args[1];
-    char* tailtxt = args[2];
-    char* keyword = args[3];
-    char* number = args[4]; 
+    char* platform = args[1];
+    char* custom_ctype = args[2];
+    char* custom_body = args[3];
+    char* headtxt = args[4];
+    char* tailtxt = args[5];
 
-    // 添加线程清理处理程序
-    pthread_cleanup_push(free, webhook);
-    pthread_cleanup_push(free, headtxt);
-    pthread_cleanup_push(free, tailtxt);
-    pthread_cleanup_push(free, keyword);
-    pthread_cleanup_push(free, number); 
-    pthread_cleanup_push(free, args);
-
-    time_t last_size = 0;
-    time_t last_check_time = time(NULL);
     while (threads_running) {
-        FILE *fp = fopen("/tmp/zte_log.txt", "r");
-        if (fp) {
-            fseek(fp, 0, SEEK_END);
-            long size = ftell(fp);
-            fclose(fp);
-            if (size != last_size) {
-                last_size = size;
-                
-                // 只有在实际处理匹配的短信时才更新接收状态
-                // 先检查是否存在匹配write(1, ...)格式的短信
-                int has_sms_content = 0;
-                fp = fopen("/tmp/zte_log.txt", "r");
-                if (fp) {
-                    char line[4096];
-                    regex_t reg;
-                    regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
-                    
-                    while (fgets(line, sizeof(line), fp)) {
-                        if (regexec(&reg, line, 0, NULL, 0) == 0) {
-                            has_sms_content = 1;
-                            break;
-                        }
-                    }
-                    regfree(&reg);
-                    fclose(fp);
-                }
-                
-                if (has_sms_content) {
-                    // 标记正在接收短信
-                    sms_receiving = 1;
-                    last_sms_activity = time(NULL);
-                    printf("[DEBUG] SMS receiving detected, updating activity timestamp\n");
-                }
-                
-                extract_and_send_sms_from_log(webhook, headtxt, tailtxt, keyword, number);
-                // 当检测到日志文件变化时，更新最后检测到短信的时间
-                last_sms_detected_time = time(NULL);
-            }
+        char line[MAX_BUFFER_LEN];
+        if (strace_queue_pop_line(line, sizeof(line), 1000)) {
+            process_strace_line_for_sms(line, webhook, platform,
+                                        custom_ctype, custom_body,
+                                        headtxt, tailtxt);
         }
-        
-        // 每5秒检查一次临时存储中的短信
-        time_t current_time = time(NULL);
-        if (current_time - last_check_time >= 5) {
-            printf("[DEBUG] 5-second check cycle triggered\n");
-            
-            // 检查是否存在匹配write(1, ...)格式的短信
-            int has_sms_content = 0;
-            fp = fopen("/tmp/zte_log.txt", "r");
-            if (fp) {
-                char line[4096];
-                regex_t reg;
-                regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
-                
-                while (fgets(line, sizeof(line), fp)) {
-                    if (regexec(&reg, line, 0, NULL, 0) == 0) {
-                        has_sms_content = 1;
-                        break;
-                    }
-                }
-                regfree(&reg);
-                fclose(fp);
-            }
-            
-            if (has_sms_content) {
-                // 标记正在处理短信
-                sms_receiving = 1;
-                last_sms_activity = time(NULL);
-                printf("[DEBUG] SMS content detected in 5-second check, updating activity timestamp\n");
-            }
-            
-            extract_and_send_sms_from_log(webhook, headtxt, tailtxt, keyword, number);
-            last_check_time = current_time;
-            // 当触发5秒检查时，也更新最后检测到短信的时间
-            last_sms_detected_time = time(NULL);
-        }
-        
-        // 如果超过2秒没有活动，标记为非接收状态
-        if (time(NULL) - last_sms_activity > 2) {
-            sms_receiving = 0;
-        }
-        
-        usleep(1000*1000); // 1秒轮询
     }
-    
-    pthread_cleanup_pop(1);
-    pthread_cleanup_pop(1);
-    pthread_cleanup_pop(1);
-    pthread_cleanup_pop(1);
-    pthread_cleanup_pop(1);
-    pthread_cleanup_pop(1);
-
     return NULL;
 }
 
-
-
-// 修改 extract_write_lines_from_log 函数，只匹配特定格式的短信信息
+// 提取 /tmp/zte_log.txt 中所有 write(数字, "内容", 数字) = 数字 的行
 void extract_write_lines_from_log() {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) {
@@ -701,10 +451,10 @@ void extract_write_lines_from_log() {
         return;
     }
     char line[2048];
-    // 修改匹配 write(1, ...) 格式的正则表达式
+    // 匹配 write(数字, "内容", 数字) = 数字
     regex_t reg;
-    // 只匹配write(1, ...)格式的短信信息
-    regcomp(&reg, "^\\s*(\\[pid [0-9]+\\] )?write\\(1, \\\".*\\+CMT:.*\\\", [0-9]+\\)", REG_EXTENDED);
+    // 匹配如: write(16, "...", 91) = 91
+    regcomp(&reg, "^\\s*write\\([0-9]+, \\\".*\\\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
     while (fgets(line, sizeof(line), fp)) {
         if (regexec(&reg, line, 0, NULL, 0) == 0) {
             printf("%s", line);
@@ -716,17 +466,16 @@ void extract_write_lines_from_log() {
 
 // PDU解码信息结构体和解码函数
 
-// 修改1: 增大text缓冲区以支持更长的短信内容
 typedef struct {
-    char smsc[64];
-    char sender[64];
-    char timestamp[64];
-    char tp_pid[8];
-    char tp_dcs[8];
-    char tp_dcs_desc[64];
-    char sms_class[16];
-    char alphabet[64];
-    char text[8192]; // 从4096增加到8192，确保能容纳更长的短信内容
+    char smsc[32];
+    char sender[32];
+    char timestamp[32];
+    char tp_pid[4];
+    char tp_dcs[4];
+    char tp_dcs_desc[32];
+    char sms_class[8];
+    char alphabet[32];
+    char text[2048];
     int text_len;
 } sms_info_t;
 
@@ -735,645 +484,11 @@ typedef struct {
 typedef struct {
     char sender[32];
     char timestamp[32];
-    char text[128];
+    char text[2048];
 } sms_uniq_t;
 static sms_uniq_t sms_uniq_queue[SMS_UNIQ_QUEUE_SIZE];
 static int sms_uniq_head = 0;
 static int sms_uniq_count = 0;
-
-// 检查是否在连续检测窗口中
-int is_sms_in_detection_window(const char *sender, const char *timestamp, const char *text) {
-    int i;
-    for (i = 0; i < detection_count; i++) {
-        int idx = (detection_head + i) % DETECTION_WINDOW_SIZE;
-        if (strcmp(detection_window[idx].sender, sender) == 0 &&
-            strcmp(detection_window[idx].timestamp, timestamp) == 0 &&
-            strcmp(detection_window[idx].text, text) == 0) {
-            return idx; // 返回索引
-        }
-    }
-    return -1; // 未找到
-}
-
-// 添加到连续检测窗口
-void add_sms_to_detection_window(const char *sender, const char *timestamp, const char *text) {
-    int idx = is_sms_in_detection_window(sender, timestamp, text);
-    
-    // 如果已存在，增加计数
-    if (idx != -1) {
-        detection_window[idx].count++;
-        detection_window[idx].last_seen = time(NULL);
-        return;
-    }
-    
-    // 添加新条目
-    int new_idx;
-    if (detection_count < DETECTION_WINDOW_SIZE) {
-        new_idx = (detection_head + detection_count) % DETECTION_WINDOW_SIZE;
-        detection_count++;
-    } else {
-        new_idx = detection_head;
-        detection_head = (detection_head + 1) % DETECTION_WINDOW_SIZE;
-    }
-    
-    strncpy(detection_window[new_idx].sender, sender, sizeof(detection_window[new_idx].sender)-1);
-    detection_window[new_idx].sender[sizeof(detection_window[new_idx].sender)-1] = 0;
-    
-    strncpy(detection_window[new_idx].timestamp, timestamp, sizeof(detection_window[new_idx].timestamp)-1);
-    detection_window[new_idx].timestamp[sizeof(detection_window[new_idx].timestamp)-1] = 0;
-    
-    strncpy(detection_window[new_idx].text, text, sizeof(detection_window[new_idx].text)-1);
-    detection_window[new_idx].text[sizeof(detection_window[new_idx].text)-1] = 0;
-    
-    detection_window[new_idx].count = 1;
-    detection_window[new_idx].last_seen = time(NULL);
-}
-
-// 清理过期的检测条目（超过30秒的条目）
-void cleanup_detection_window() {
-    time_t now = time(NULL);
-    int i = 0;
-    while (i < detection_count) {
-        int idx = (detection_head + i) % DETECTION_WINDOW_SIZE;
-        if (now - detection_window[idx].last_seen > 30) {
-            // 移除这个条目
-            if (idx == detection_head) {
-                detection_head = (detection_head + 1) % DETECTION_WINDOW_SIZE;
-                detection_count--;
-            } else {
-                // 简单处理：只清理头部过期条目
-                break;
-            }
-        } else {
-            i++;
-        }
-    }
-}
-
-// 检查PDU片段队列中是否存在匹配的完整PDU
-int is_pdu_fragment_in_queue(const char *sender, const char *timestamp, const char *pdu_fragment) {
-    int i;
-    for (i = 0; i < pdu_fragment_count; i++) {
-        int idx = (pdu_fragment_head + i) % PDU_FRAGMENT_QUEUE_SIZE;
-        if (strcmp(pdu_fragment_queue[idx].sender, sender) == 0 &&
-            strcmp(pdu_fragment_queue[idx].timestamp, timestamp) == 0 &&
-            strstr(pdu_fragment_queue[idx].pdu_fragment, pdu_fragment) != NULL) {
-            return 1; // 找到匹配的完整PDU
-        }
-    }
-    return 0; // 未找到
-}
-
-// 添加PDU片段到队列
-void add_pdu_fragment_to_queue(const char *sender, const char *timestamp, const char *pdu_fragment) {
-    // 检查是否已存在相同的片段
-    int i;
-    for (i = 0; i < pdu_fragment_count; i++) {
-        int idx = (pdu_fragment_head + i) % PDU_FRAGMENT_QUEUE_SIZE;
-        if (strcmp(pdu_fragment_queue[idx].sender, sender) == 0 &&
-            strcmp(pdu_fragment_queue[idx].timestamp, timestamp) == 0 &&
-            strcmp(pdu_fragment_queue[idx].pdu_fragment, pdu_fragment) == 0) {
-            return; // 已存在，不重复添加
-        }
-    }
-    
-    // 添加新片段
-    int idx;
-    if (pdu_fragment_count < PDU_FRAGMENT_QUEUE_SIZE) {
-        idx = (pdu_fragment_head + pdu_fragment_count) % PDU_FRAGMENT_QUEUE_SIZE;
-        pdu_fragment_count++;
-    } else {
-        idx = pdu_fragment_head;
-        pdu_fragment_head = (pdu_fragment_head + 1) % PDU_FRAGMENT_QUEUE_SIZE;
-    }
-    
-    strncpy(pdu_fragment_queue[idx].sender, sender, sizeof(pdu_fragment_queue[idx].sender)-1);
-    pdu_fragment_queue[idx].sender[sizeof(pdu_fragment_queue[idx].sender)-1] = 0;
-    
-    strncpy(pdu_fragment_queue[idx].timestamp, timestamp, sizeof(pdu_fragment_queue[idx].timestamp)-1);
-    pdu_fragment_queue[idx].timestamp[sizeof(pdu_fragment_queue[idx].timestamp)-1] = 0;
-    
-    strncpy(pdu_fragment_queue[idx].pdu_fragment, pdu_fragment, sizeof(pdu_fragment_queue[idx].pdu_fragment)-1);
-    pdu_fragment_queue[idx].pdu_fragment[sizeof(pdu_fragment_queue[idx].pdu_fragment)-1] = 0;
-    
-    pdu_fragment_queue[idx].received_time = time(NULL);
-}
-
-// 清理过期的PDU片段（超过3秒的片段）
-void cleanup_pdu_fragment_queue() {
-    time_t now = time(NULL);
-    int i = 0;
-    while (i < pdu_fragment_count) {
-        int idx = (pdu_fragment_head + i) % PDU_FRAGMENT_QUEUE_SIZE;
-        if (now - pdu_fragment_queue[idx].received_time > 3) {
-            // 移除这个条目
-            if (idx == pdu_fragment_head) {
-                pdu_fragment_head = (pdu_fragment_head + 1) % PDU_FRAGMENT_QUEUE_SIZE;
-                pdu_fragment_count--;
-            } else {
-                // 简单处理：只清理头部过期条目
-                break;
-            }
-        } else {
-            i++;
-        }
-    }
-}
-
-// 从PDU中提取长短信信息，严格按照GSM 03.38协议
-int extract_long_sms_info(const char *pdu, unsigned char *ref, unsigned char *max, unsigned char *seq) {
-    int idx = 0;
-    int pdu_len = strlen(pdu);
-    
-    if (pdu_len < 10) return 0;
-    
-    // 跳过SMSC信息
-    int smsc_len = 0;
-    sscanf(pdu, "%2x", &smsc_len);
-    idx += 2 + smsc_len * 2;
-    
-    if (idx + 12 >= pdu_len) return 0;
-    
-    // 跳过PDU类型和地址信息
-    idx += 2; // PDU类型
-    int sender_len = 0;
-    sscanf(pdu + idx, "%2x", &sender_len);
-    idx += 2;
-    int sender_type = 0;
-    sscanf(pdu + idx, "%2x", &sender_type);
-    idx += 2;
-    int sender_bcd_len = (sender_len % 2 == 0) ? sender_len : sender_len + 1;
-    sender_bcd_len /= 2;
-    sender_bcd_len *= 2;
-    idx += sender_bcd_len;
-    
-    // TP-PID和TP-DCS
-    idx += 4;
-    
-    // 时间戳
-    idx += 14;
-    
-    // 用户数据长度
-    if (idx + 2 >= pdu_len) return 0;
-    int text_len_oct = 0;
-    sscanf(pdu + idx, "%2x", &text_len_oct);
-    idx += 2;
-    
-    // 检查是否有头部信息
-    if (idx + 2 >= pdu_len) return 0;
-    int udh_len = 0;
-    sscanf(pdu + idx, "%2x", &udh_len);
-    
-    // 检查是否为长短信 (UDH长度至少为6字节)
-    // 根据GSM 03.38协议，长短信UDH包含:
-    // - UDH长度字段 (1字节)
-    // - 信息元素标识符 IEI (1字节，0x00表示连接短信)
-    // - 信息元素长度 IEL (1字节，固定为0x03)
-    // - 信息参考号 (1字节)
-    // - 总片段数 (1字节)
-    // - 当前片段序号 (1字节)
-    if (udh_len >= 6) {
-        int udh_idx = idx + 2;
-        while (udh_idx + 6 <= pdu_len && udh_idx < idx + 2 + udh_len * 2) {
-            int ie_id = 0, ie_len = 0;
-            sscanf(pdu + udh_idx, "%2x", &ie_id);
-            udh_idx += 2;
-            if (udh_idx >= pdu_len) break;
-            sscanf(pdu + udh_idx, "%2x", &ie_len);
-            udh_idx += 2;
-            
-            // 检查是否为连接短信的IEI (0x00) 且长度为0x03
-            if (ie_id == 0x00 && ie_len == 0x03) {
-                if (udh_idx + 6 <= pdu_len) {
-                    sscanf(pdu + udh_idx, "%2hhx", ref);
-                    sscanf(pdu + udh_idx + 2, "%2hhx", max);
-                    sscanf(pdu + udh_idx + 4, "%2hhx", seq);
-                    return 1; // 成功提取长短信信息
-                }
-            }
-            udh_idx += ie_len * 2;
-        }
-    }
-    
-    return 0; // 不是长短信
-}
-
-// 添加长短信片段到队列，确保按正确顺序存储
-void add_long_sms_fragment(const char *sender, const char *timestamp, 
-                          unsigned char ref, unsigned char max, unsigned char seq, 
-                          const char *text, const char *pdu) {
-    // 验证参数有效性
-    if (max == 0 || seq == 0 || seq > max) {
-        printf("[DEBUG] Invalid long SMS fragment parameters: ref=%d, max=%d, seq=%d\n", ref, max, seq);
-        return;
-    }
-    
-    // 检查是否已存在相同的片段（相同发件人、时间戳、参考号、序号）
-    int i;
-    for (i = 0; i < long_sms_fragment_count; i++) {
-        int idx = (long_sms_fragment_head + i) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-        if (strcmp(long_sms_fragment_queue[idx].sender, sender) == 0 &&
-            strcmp(long_sms_fragment_queue[idx].timestamp, timestamp) == 0 &&
-            long_sms_fragment_queue[idx].ref == ref &&
-            long_sms_fragment_queue[idx].seq == seq) {
-            // 已存在相同片段，不重复添加
-            printf("[DEBUG] Duplicate long SMS fragment ignored: ref=%d, seq=%d/%d\n", ref, seq, max);
-            return;
-        }
-    }
-    
-    // 添加新片段到队列末尾（保持接收顺序）
-    int queue_idx;
-    if (long_sms_fragment_count < LONG_SMS_FRAGMENT_QUEUE_SIZE) {
-        queue_idx = (long_sms_fragment_head + long_sms_fragment_count) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-        long_sms_fragment_count++;
-    } else {
-        // 队列已满，移除最旧的片段（队列头部）
-        queue_idx = long_sms_fragment_head;
-        long_sms_fragment_head = (long_sms_fragment_head + 1) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-    }
-    
-    strncpy(long_sms_fragment_queue[queue_idx].sender, sender, sizeof(long_sms_fragment_queue[0].sender)-1);
-    long_sms_fragment_queue[queue_idx].sender[sizeof(long_sms_fragment_queue[0].sender)-1] = 0;
-    
-    strncpy(long_sms_fragment_queue[queue_idx].timestamp, timestamp, sizeof(long_sms_fragment_queue[0].timestamp)-1);
-    long_sms_fragment_queue[queue_idx].timestamp[sizeof(long_sms_fragment_queue[0].timestamp)-1] = 0;
-    
-    long_sms_fragment_queue[queue_idx].ref = ref;
-    long_sms_fragment_queue[queue_idx].max = max;
-    long_sms_fragment_queue[queue_idx].seq = seq;
-    
-    strncpy(long_sms_fragment_queue[queue_idx].text, text, sizeof(long_sms_fragment_queue[0].text)-1);
-    long_sms_fragment_queue[queue_idx].text[sizeof(long_sms_fragment_queue[0].text)-1] = 0;
-    
-    strncpy(long_sms_fragment_queue[queue_idx].pdu, pdu, sizeof(long_sms_fragment_queue[0].pdu)-1);
-    long_sms_fragment_queue[queue_idx].pdu[sizeof(long_sms_fragment_queue[0].pdu)-1] = 0;
-    
-    long_sms_fragment_queue[queue_idx].received_time = time(NULL);
-    
-    printf("[DEBUG] Added long SMS fragment: ref=%d, seq=%d/%d\n", ref, seq, max);
-}
-
-// 检查是否可以重组长短信
-int can_reassemble_long_sms(const char *sender, const char *timestamp, unsigned char ref, unsigned char max) {
-    int count = 0;
-    int i;
-    for (i = 0; i < long_sms_fragment_count; i++) {
-        int idx = (long_sms_fragment_head + i) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-        if (strcmp(long_sms_fragment_queue[idx].sender, sender) == 0 &&
-            strcmp(long_sms_fragment_queue[idx].timestamp, timestamp) == 0 &&
-            long_sms_fragment_queue[idx].ref == ref &&
-            long_sms_fragment_queue[idx].max == max) {
-            count++;
-        }
-    }
-    return (count == max); // 所有片段都已收到
-}
-
-// 重组长短信，按照接收顺序进行拼接（正序）
-int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char ref, unsigned char max, char *output, size_t output_size, char *combined_pdu, size_t pdu_size) {
-    // 验证参数
-    if (max == 0 || max > 255) {
-        printf("[DEBUG] Invalid max fragments count: %d\n", max);
-        return 0;
-    }
-    
-    // 创建数组存储找到的片段索引，按接收顺序保存
-    int fragment_indices[LONG_SMS_FRAGMENT_QUEUE_SIZE];
-    int fragment_seq_map[LONG_SMS_FRAGMENT_QUEUE_SIZE]; // 存储对应的序号
-    int fragment_count = 0;
-    int i;
-    
-    // 收集所有属于当前长短信的片段，按接收顺序保存索引
-    for (i = 0; i < long_sms_fragment_count; i++) {
-        int idx = (long_sms_fragment_head + i) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-        if (strcmp(long_sms_fragment_queue[idx].sender, sender) == 0 &&
-            strcmp(long_sms_fragment_queue[idx].timestamp, timestamp) == 0 &&
-            long_sms_fragment_queue[idx].ref == ref) {
-            
-            // 验证序号有效性
-            unsigned char seq = long_sms_fragment_queue[idx].seq;
-            if (seq >= 1 && seq <= max) {
-                fragment_indices[fragment_count] = idx;
-                fragment_seq_map[fragment_count] = seq;
-                fragment_count++;
-            } else {
-                printf("[DEBUG] Invalid fragment sequence number: %d (max: %d)\n", seq, max);
-            }
-        }
-    }
-    
-    // 检查是否所有片段都存在
-    if (fragment_count != max) {
-        printf("[DEBUG] Fragment count mismatch: found %d, expected %d\n", fragment_count, max);
-        return 0; // 片段数量不匹配
-    }
-    
-    // 按照片段序号重新排序索引（正序组装）
-    // 使用选择排序按序号排序
-    for (i = 0; i < fragment_count - 1; i++) {
-        int min_idx = i;
-        int j;
-        for (j = i + 1; j < fragment_count; j++) {
-            if (fragment_seq_map[j] < fragment_seq_map[min_idx]) {
-                min_idx = j;
-            }
-        }
-        // 交换索引和序号
-        if (min_idx != i) {
-            int temp_idx = fragment_indices[i];
-            fragment_indices[i] = fragment_indices[min_idx];
-            fragment_indices[min_idx] = temp_idx;
-            
-            int temp_seq = fragment_seq_map[i];
-            fragment_seq_map[i] = fragment_seq_map[min_idx];
-            fragment_seq_map[min_idx] = temp_seq;
-        }
-    }
-    
-    // 重组文本，按序号顺序进行拼接（正序处理）
-    output[0] = '\0';
-    size_t current_len = 0;
-    
-    // 按序号顺序拼接（1, 2, 3, ...）
-    for (i = 0; i < fragment_count; i++) {
-        int idx = fragment_indices[i];
-        size_t fragment_len = strlen(long_sms_fragment_queue[idx].text);
-        if (current_len + fragment_len < output_size - 1) {
-            strcat(output, long_sms_fragment_queue[idx].text);
-            current_len += fragment_len;
-        } else {
-            printf("[WARN] Output buffer too small for reassembled SMS\n");
-            break; // 输出缓冲区不足
-        }
-    }
-    
-    // 组合所有PDU片段，也按序号顺序
-    combined_pdu[0] = '\0';
-    size_t pdu_len = 0;
-    for (i = 0; i < fragment_count; i++) {
-        int idx = fragment_indices[i];
-        size_t pdu_fragment_len = strlen(long_sms_fragment_queue[idx].pdu);
-        if (pdu_len + pdu_fragment_len < pdu_size - 1) {
-            strcat(combined_pdu, long_sms_fragment_queue[idx].pdu);
-            pdu_len += pdu_fragment_len;
-        } else {
-            printf("[WARN] PDU buffer too small for combined PDU\n");
-            break;
-        }
-    }
-    
-    printf("[DEBUG] Successfully reassembled long SMS with %d fragments in normal order\n", max);
-    return 1; // 重组成功
-}
-
-// 清理已成功重组的长短信片段
-void cleanup_processed_long_sms_fragments(const char *sender, const char *timestamp, unsigned char ref, unsigned char max) {
-    int i = 0;
-    while (i < long_sms_fragment_count) {
-        int idx = (long_sms_fragment_head + i) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-        if (strcmp(long_sms_fragment_queue[idx].sender, sender) == 0 &&
-            strcmp(long_sms_fragment_queue[idx].timestamp, timestamp) == 0 &&
-            long_sms_fragment_queue[idx].ref == ref) {
-            // 移除这个片段
-            if (idx == long_sms_fragment_head) {
-                long_sms_fragment_head = (long_sms_fragment_head + 1) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-                long_sms_fragment_count--;
-            } else {
-                // 移动后续项向前
-                int j;
-                for (j = idx; j < long_sms_fragment_count - 1; j++) {
-                    int src_idx = (long_sms_fragment_head + j + 1) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-                    int dst_idx = (long_sms_fragment_head + j) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-                    long_sms_fragment_queue[dst_idx] = long_sms_fragment_queue[src_idx];
-                }
-                long_sms_fragment_count--;
-            }
-        } else {
-            i++;
-        }
-    }
-    
-    printf("[DEBUG] Cleaned up processed long SMS fragments: ref=%d, max=%d\n", ref, max);
-}
-
-// 清理过期的长短信片段（超过30秒的片段）
-void cleanup_long_sms_fragment_queue() {
-    time_t now = time(NULL);
-    int i = 0;
-    while (i < long_sms_fragment_count) {
-        int idx = (long_sms_fragment_head + i) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-        if (now - long_sms_fragment_queue[idx].received_time > 30) {
-            // 移除这个条目
-            if (idx == long_sms_fragment_head) {
-                long_sms_fragment_head = (long_sms_fragment_head + 1) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
-                long_sms_fragment_count--;
-            } else {
-                // 简单处理：只清理头部过期条目
-                break;
-            }
-        } else {
-            i++;
-        }
-    }
-}
-
-// 修改后的 add_sms_to_temp_storage 函数
-int add_sms_to_temp_storage(const char *sender, const char *timestamp, const char *text, const char *pdu) {
-    // 查找是否已存在相同发件人和时间戳的记录
-    int i;
-    for (i = 0; i < temp_sms_storage_count; i++) {
-        if (strcmp(temp_sms_storage[i].sender, sender) == 0 &&
-            strcmp(temp_sms_storage[i].timestamp, timestamp) == 0) {
-            
-            // 检查是否已存在相同的文本内容（完全相同）
-            if (strcmp(temp_sms_storage[i].text, text) == 0) {
-                printf("[DEBUG] Duplicate SMS content ignored in temp storage\n");
-                return 0; // 已存在相同内容
-            }
-            
-            // 检查新内容是否是现有内容的子串
-            if (strstr(temp_sms_storage[i].text, text) != NULL) {
-                printf("[DEBUG] SMS content is already part of existing message\n");
-                return 0;
-            }
-            
-            // 检查现有内容是否是新内容的子串（需要用新内容替换）
-            if (strstr(text, temp_sms_storage[i].text) != NULL) {
-                printf("[DEBUG] Updating SMS content with more complete version\n");
-                strncpy(temp_sms_storage[i].text, text, sizeof(temp_sms_storage[i].text) - 1);
-                temp_sms_storage[i].text[sizeof(temp_sms_storage[i].text) - 1] = '\0';
-                
-                // 更新PDU存储
-                if (temp_sms_storage[i].pdu_count < 10) {
-                    strncpy(temp_sms_storage[i].pdu_list[temp_sms_storage[i].pdu_count], pdu, sizeof(temp_sms_storage[i].pdu_list[0]) - 1);
-                    temp_sms_storage[i].pdu_list[temp_sms_storage[i].pdu_count][sizeof(temp_sms_storage[i].pdu_list[0]) - 1] = '\0';
-                    temp_sms_storage[i].pdu_count++;
-                }
-                
-                temp_sms_storage[i].last_received = time(NULL);
-                printf("[DEBUG] Updated existing temp storage entry: sender=%s, timestamp=%s\n", sender, timestamp);
-                return 1;
-            }
-            
-            // 检查是否内容部分重叠（避免重复拼接）
-            size_t existing_len = strlen(temp_sms_storage[i].text);
-            size_t new_len = strlen(text);
-            
-            // 简单的重叠检查：检查新内容的开头是否与现有内容的结尾匹配
-            int overlap = 0;
-            if (existing_len > 10 && new_len > 10) {
-                // 取现有内容的最后10个字符
-                char *existing_end = temp_sms_storage[i].text + existing_len - 10;
-                // 检查是否在新内容的前10个字符中找到匹配
-                if (strncmp(existing_end, text, (new_len > 10 ? 10 : new_len)) == 0) {
-                    overlap = 1;
-                }
-            }
-            
-            // 添加新的文本内容和PDU（只在没有重叠时）
-            if (temp_sms_storage[i].pdu_count < 10) {
-                if (!overlap) {
-                    // 连接文本内容
-                    if (existing_len + new_len < sizeof(temp_sms_storage[i].text) - 1) {
-                        strcat(temp_sms_storage[i].text, text);
-                    }
-                } else {
-                    printf("[DEBUG] Overlapping content detected, skipping concatenation\n");
-                }
-                
-                // 存储PDU
-                strncpy(temp_sms_storage[i].pdu_list[temp_sms_storage[i].pdu_count], pdu, sizeof(temp_sms_storage[i].pdu_list[0]) - 1);
-                temp_sms_storage[i].pdu_list[temp_sms_storage[i].pdu_count][sizeof(temp_sms_storage[i].pdu_list[0]) - 1] = '\0';
-                temp_sms_storage[i].pdu_count++;
-                
-                temp_sms_storage[i].last_received = time(NULL);
-                printf("[DEBUG] Added SMS fragment to existing temp storage: sender=%s, timestamp=%s\n", sender, timestamp);
-                return 1;
-            }
-            return 0; // 已达到最大片段数
-        }
-    }
-    
-    // 创建新的记录
-    if (temp_sms_storage_count < TEMP_SMS_STORAGE_SIZE) {
-        int idx = temp_sms_storage_count;
-        temp_sms_storage_count++;
-        
-        strncpy(temp_sms_storage[idx].sender, sender, sizeof(temp_sms_storage[idx].sender) - 1);
-        temp_sms_storage[idx].sender[sizeof(temp_sms_storage[idx].sender) - 1] = '\0';
-        
-        strncpy(temp_sms_storage[idx].timestamp, timestamp, sizeof(temp_sms_storage[idx].timestamp) - 1);
-        temp_sms_storage[idx].timestamp[sizeof(temp_sms_storage[idx].timestamp) - 1] = '\0';
-        
-        strncpy(temp_sms_storage[idx].text, text, sizeof(temp_sms_storage[idx].text) - 1);
-        temp_sms_storage[idx].text[sizeof(temp_sms_storage[idx].text) - 1] = '\0';
-        
-        // 存储第一个PDU
-        strncpy(temp_sms_storage[idx].pdu_list[0], pdu, sizeof(temp_sms_storage[idx].pdu_list[0]) - 1);
-        temp_sms_storage[idx].pdu_list[0][sizeof(temp_sms_storage[idx].pdu_list[0]) - 1] = '\0';
-        temp_sms_storage[idx].pdu_count = 1;
-        
-        temp_sms_storage[idx].first_received = time(NULL);
-        temp_sms_storage[idx].last_received = time(NULL);
-        
-        printf("[DEBUG] Created new temp storage entry: sender=%s, timestamp=%s\n", sender, timestamp);
-        return 1;
-    }
-    
-    return 0; // 存储已满
-}
-
-// 修改后的 check_temp_storage_for_processing 函数
-int check_temp_storage_for_processing(sms_info_t *combined_info, char *combined_pdu, size_t pdu_size) {
-    time_t now = time(NULL);
-    int i;
-    
-    for (i = 0; i < temp_sms_storage_count; i++) {
-        // 检查是否超过5秒未收到新片段
-        if (now - temp_sms_storage[i].last_received >= 5) {
-            printf("[DEBUG] Processing combined SMS from temp storage: sender=%s, timestamp=%s\n", 
-                   temp_sms_storage[i].sender, temp_sms_storage[i].timestamp);
-            
-            // 去除重复内容
-            char *text = temp_sms_storage[i].text;
-            size_t text_len = strlen(text);
-            
-            // 如果文本长度超过一定长度，检查是否有重复模式
-            if (text_len > 50) {
-                // 检查前1/3的内容是否在后面重复出现
-                size_t check_len = text_len / 3;
-                if (check_len > 50) check_len = 50;
-                
-                char *second_occurrence = strstr(text + check_len, text);
-                if (second_occurrence != NULL) {
-                    // 发现重复，截断到第一次出现结束
-                    *(second_occurrence) = '\0';
-                    printf("[DEBUG] Removed duplicate content from SMS, new length: %zu\n", strlen(text));
-                }
-            }
-            
-            // 填充combined_info
-            strncpy(combined_info->sender, temp_sms_storage[i].sender, sizeof(combined_info->sender) - 1);
-            combined_info->sender[sizeof(combined_info->sender) - 1] = '\0';
-            
-            strncpy(combined_info->timestamp, temp_sms_storage[i].timestamp, sizeof(combined_info->timestamp) - 1);
-            combined_info->timestamp[sizeof(combined_info->timestamp) - 1] = '\0';
-            
-            strncpy(combined_info->text, temp_sms_storage[i].text, sizeof(combined_info->text) - 1);
-            combined_info->text[sizeof(combined_info->text) - 1] = '\0';
-            
-            // 组合所有PDU
-            combined_pdu[0] = '\0';
-            size_t current_len = 0;
-            int j;
-            for (j = 0; j < temp_sms_storage[i].pdu_count; j++) {
-                size_t pdu_len = strlen(temp_sms_storage[i].pdu_list[j]);
-                if (current_len + pdu_len < pdu_size - 1) {
-                    strcat(combined_pdu, temp_sms_storage[i].pdu_list[j]);
-                    current_len += pdu_len;
-                }
-            }
-            
-            // 显示合并后的结果
-            printf("[DEBUG] Combined SMS content: %s\n", combined_info->text);
-            printf("[DEBUG] Combined PDU: %s\n", combined_pdu);
-            
-            // 移除已处理的记录
-            for (j = i; j < temp_sms_storage_count - 1; j++) {
-                temp_sms_storage[j] = temp_sms_storage[j + 1];
-            }
-            temp_sms_storage_count--;
-            
-            return 1; // 找到需要处理的短信
-        }
-    }
-    
-    return 0; // 没有需要处理的短信
-}
-
-// 清理过期的临时存储记录
-void cleanup_temp_storage() {
-    time_t now = time(NULL);
-    int i = 0;
-    
-    while (i < temp_sms_storage_count) {
-        // 如果超过30秒未更新，则清理
-        if (now - temp_sms_storage[i].last_received > 30) {
-            printf("[DEBUG] Cleaning up expired temp storage entry: sender=%s, timestamp=%s\n",
-                   temp_sms_storage[i].sender, temp_sms_storage[i].timestamp);
-            
-            // 移动后续项向前
-            int j;
-            for (j = i; j < temp_sms_storage_count - 1; j++) {
-                temp_sms_storage[j] = temp_sms_storage[j + 1];
-            }
-            temp_sms_storage_count--;
-        } else {
-            i++;
-        }
-    }
-}
 
 int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *text) {
     int i;
@@ -1387,7 +502,6 @@ int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *
     }
     return 0;
 }
-
 void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char *text) {
     int idx;
     if (sms_uniq_count < SMS_UNIQ_QUEUE_SIZE) {
@@ -1411,291 +525,110 @@ void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char
 }
 
 static char last_sender[32] = "";
-static char last_text[128] = "";
+static char last_text[2048] = "";
 static time_t last_sms_time = 0;
 static char last_pdu[256] = "";
 static time_t last_pdu_time = 0;
 static time_t service_start_time = 0;
+static char device_msisdn[64] = "";
 
-// GSM 7-bit 默认字母表到ASCII的映射表
-static const char gsm7bit_default[128] = {
-    '@', 0x00, '$', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '\n', 0x00, 0x00, '\r', 0x00, 0x00,
-    0x00, '_', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1B, 0x00, 0x00, 0x00, 0x00,
-    ' ', '!', '"', '#', 0x00, '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
-    0x00, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
-    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
-    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 0x00, 0x00, 0x00, 0x00, 0x00
-};
+static void load_device_msisdn_from_nv_show(void) {
+    device_msisdn[0] = 0;
+    FILE *fp = popen("nv show", "r");
+    if (!fp) return;
 
-// GSM 7-bit 扩展字符表 (需要转义字符)
-static const char gsm7bit_ext[128] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '\n', 0x00, 0x00, '\r', 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, '^', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '{', '}', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '[', '~', ']', 0x00,
-    '|', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = strstr(line, "msisdn=");
+        if (!p) continue;
+        p += strlen("msisdn=");
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '"' || *p == '\'') p++;
+        char *end = p;
+        while (*end && !isspace((unsigned char)*end) && *end != '"' && *end != '\'' && *end != ';') end++;
+        size_t len = (size_t)(end - p);
+        if (len == 0) continue;
+        if (len >= sizeof(device_msisdn)) len = sizeof(device_msisdn) - 1;
+        memcpy(device_msisdn, p, len);
+        device_msisdn[len] = 0;
+        break;
+    }
 
-// 解码7-bit编码的短信内容
-void decode_7bit_pdu(const char *pdu_data, int data_len_oct, char *output, size_t output_size) {
-    // 将十六进制字符串转换为二进制数据
-    unsigned char *binary_data = (unsigned char *)malloc(data_len_oct);
-    if (!binary_data) {
-        output[0] = '\0';
-        return;
-    }
-    
-    // 清空输出缓冲区
-    memset(output, 0, output_size);
-    
-    // 将十六进制字符串转换为二进制数据
-    int i, j;
-    for (i = 0; i < data_len_oct && (i * 2 + 1) < (int)strlen(pdu_data); i++) {
-        char hex_byte[3] = {pdu_data[i*2], pdu_data[i*2+1], '\0'};
-        unsigned int byte_val;
-        sscanf(hex_byte, "%x", &byte_val);
-        binary_data[i] = (unsigned char)byte_val;
-    }
-    
-    // 7-bit解码 - 使用位操作方法
-    int out_idx = 0;
-    int bit_offset = 0;
-    
-    // 计算实际的7-bit字符数
-    int total_bits = data_len_oct * 8;
-    int septet_count = total_bits / 7;
-    
-    for (i = 0; i < septet_count && out_idx < (int)output_size - 1; i++) {
-        // 计算当前7-bit字符在数据中的位置
-        int byte_index = bit_offset / 8;
-        int bit_index = bit_offset % 8;
-        
-        if (byte_index >= data_len_oct) {
-            break;
-        }
-        
-        unsigned char septet;
-        if (bit_index <= 1) {
-            // 字符完全在当前字节或跨越当前和下一个字节
-            if (bit_index == 0) {
-                septet = binary_data[byte_index] & 0x7F;
-            } else {
-                if (byte_index + 1 < data_len_oct) {
-                    septet = ((binary_data[byte_index] >> 1) | (binary_data[byte_index + 1] << 7)) & 0x7F;
-                } else {
-                    septet = (binary_data[byte_index] >> 1) & 0x7F;
-                }
-            }
-        } else {
-            // 字符跨越当前和下一个字节
-            if (byte_index + 1 < data_len_oct) {
-                int shift = 8 - bit_index;
-                septet = ((binary_data[byte_index] >> bit_index) | (binary_data[byte_index + 1] << shift)) & 0x7F;
-            } else {
-                septet = (binary_data[byte_index] >> bit_index) & 0x7F;
-            }
-        }
-        
-        // 检查是否是填充字符（在数据末尾）
-        if (i == septet_count - 1 && septet == 0) {
-            // 这可能是填充，跳过
-            break;
-        }
-        
-        // 处理转义字符
-        if (septet == 0x1B) {
-            // 增加位偏移以获取扩展字符
-            bit_offset += 7;
-            i++; // 跳过下一个字符的处理
-            
-            // 获取扩展字符
-            byte_index = bit_offset / 8;
-            bit_index = bit_offset % 8;
-            
-            if (byte_index >= data_len_oct) {
-                break;
-            }
-            
-            unsigned char ext_septet;
-            if (bit_index <= 1) {
-                if (bit_index == 0) {
-                    ext_septet = binary_data[byte_index] & 0x7F;
-                } else {
-                    if (byte_index + 1 < data_len_oct) {
-                        ext_septet = ((binary_data[byte_index] >> 1) | (binary_data[byte_index + 1] << 7)) & 0x7F;
-                    } else {
-                        ext_septet = (binary_data[byte_index] >> 1) & 0x7F;
-                    }
-                }
-            } else {
-                if (byte_index + 1 < data_len_oct) {
-                    int shift = 8 - bit_index;
-                    ext_septet = ((binary_data[byte_index] >> bit_index) | (binary_data[byte_index + 1] << shift)) & 0x7F;
-                } else {
-                    ext_septet = (binary_data[byte_index] >> bit_index) & 0x7F;
-                }
-            }
-            
-            if (ext_septet < 128 && out_idx < (int)output_size - 1) {
-                char ext_char = gsm7bit_ext[ext_septet];
-                if (ext_char != 0) {
-                    output[out_idx++] = ext_char;
-                }
-            }
-        } else {
-            // 处理普通字符
-            if (septet < 128 && out_idx < (int)output_size - 1) {
-                char decoded_char = gsm7bit_default[septet];
-                if (decoded_char != 0) {
-                    output[out_idx++] = decoded_char;
-                } else if (septet >= 32 && septet <= 126) {
-                    // 如果在标准ASCII范围内，直接使用
-                    output[out_idx++] = (char)septet;
-                }
-            }
-        }
-        
-        bit_offset += 7;
-    }
-    
-    output[out_idx] = '\0';
-    free(binary_data);
-    
+    pclose(fp);
 }
 
 // 完整的PDU解码，包含SMSC、发件人、时间戳等信息
 void decode_pdu(const char *pdu, sms_info_t *info) {
     memset(info, 0, sizeof(*info));
     int idx = 0;
-    int pdu_len = strlen(pdu);
-    
-    // 添加长度检查，防止处理过短的PDU
-    if (pdu_len < 10) {
-        return;
-    }
-    
     int smsc_len = 0;
     int i, j, k; // 统一声明循环变量
-    
     sscanf(pdu, "%2x", &smsc_len);
     idx += 2;
-    
-    // 添加边界检查
-    if (idx >= pdu_len) return;
-    
     int smsc_type = 0;
     sscanf(pdu + idx, "%2x", &smsc_type);
     idx += 2;
-    
-    if (idx >= pdu_len) return;
-    
     int smsc_bcd_len = (smsc_len - 1) * 2;
-    char smsc_bcd[64] = {0};
-    
-    // 确保不会越界复制
-    int copy_len = (smsc_bcd_len < (pdu_len - idx)) ? smsc_bcd_len : (pdu_len - idx);
-    copy_len = (copy_len < 63) ? copy_len : 63;
-    strncpy(smsc_bcd, pdu + idx, copy_len);
-    smsc_bcd[copy_len] = 0;
+    char smsc_bcd[32] = {0};
+    strncpy(smsc_bcd, pdu + idx, smsc_bcd_len);
+    smsc_bcd[smsc_bcd_len] = 0;
     idx += smsc_bcd_len;
-    
     j = 0;
-    for (i = 0; i < smsc_bcd_len && i < (int)sizeof(smsc_bcd)-1 && j < (int)sizeof(info->smsc)-1; i += 2) {
-        if (idx >= pdu_len) break;
+    for (i = 0; i < smsc_bcd_len; i += 2) {
         if (smsc_bcd[i+1] == 'F' || smsc_bcd[i+1] == 'f') {
             info->smsc[j++] = smsc_bcd[i];
         } else {
             info->smsc[j++] = smsc_bcd[i+1];
-            if (j < (int)sizeof(info->smsc)-1) {
-                info->smsc[j++] = smsc_bcd[i];
-            }
+            info->smsc[j++] = smsc_bcd[i];
         }
     }
     info->smsc[j] = 0;
-    
-    // 去除SMSC末尾的F/f字符
-    if (j > 0 && (info->smsc[j-1] == 'F' || info->smsc[j-1] == 'f')) {
-        info->smsc[j-1] = '\0';
-    }
-    
     // 去除多余+86前缀（只保留一次）
     if (strncmp(info->smsc, "86", 2) == 0) {
-        memmove(info->smsc, info->smsc + 2, strlen(info->smsc) - 1);
+        memmove(info->smsc, info->smsc + 2, strlen(info->smsc + 2) + 1);
     }
 
-    // 添加更多边界检查
-    if (idx + 2 >= pdu_len) return;
-    idx += 2; // PDU类型
-    
-    if (idx + 2 >= pdu_len) return;
+    int first_octet = 0;
+    sscanf(pdu + idx, "%2x", &first_octet);
+    idx += 2;
     int sender_len = 0;
     sscanf(pdu + idx, "%2x", &sender_len);
     idx += 2;
-    
-    if (idx + 2 >= pdu_len) return;
     int sender_type = 0;
     sscanf(pdu + idx, "%2x", &sender_type);
     idx += 2;
-    
     int sender_bcd_len = (sender_len % 2 == 0) ? sender_len : sender_len + 1;
     sender_bcd_len /= 2;
     sender_bcd_len *= 2;
-    
-    char sender_bcd[64] = {0};
-    copy_len = (sender_bcd_len < (pdu_len - idx)) ? sender_bcd_len : (pdu_len - idx);
-    copy_len = (copy_len < 63) ? copy_len : 63;
-    strncpy(sender_bcd, pdu + idx, copy_len);
-    sender_bcd[copy_len] = 0;
+    char sender_bcd[32] = {0};
+    strncpy(sender_bcd, pdu + idx, sender_bcd_len);
+    sender_bcd[sender_bcd_len] = 0;
     idx += sender_bcd_len;
-    
     j = 0;
-    for (i = 0; i < sender_bcd_len && i < (int)sizeof(sender_bcd)-1 && j < (int)sizeof(info->sender)-1; i += 2) {
-        if (idx >= pdu_len) break;
+    for (i = 0; i < sender_bcd_len; i += 2) {
         if (sender_bcd[i+1] == 'F' || sender_bcd[i+1] == 'f') {
             info->sender[j++] = sender_bcd[i];
         } else {
             info->sender[j++] = sender_bcd[i+1];
-            if (j < (int)sizeof(info->sender)-1) {
-                info->sender[j++] = sender_bcd[i];
-            }
+            info->sender[j++] = sender_bcd[i];
         }
     }
     info->sender[j] = 0;
-    
-    // 去除Sender末尾的F/f字符
-    if (j > 0 && (info->sender[j-1] == 'F' || info->sender[j-1] == 'f')) {
-        info->sender[j-1] = '\0';
-    }
-    
     // 去除多余+86前缀（只保留一次）
     if (strncmp(info->sender, "86", 2) == 0) {
-        memmove(info->sender, info->sender + 2, strlen(info->sender) - 1);
+        memmove(info->sender, info->sender + 2, strlen(info->sender + 2) + 1);
     }
 
     // TP_PID
-    if (idx + 2 <= pdu_len) {
-        strncpy(info->tp_pid, pdu + idx, 2);
-        info->tp_pid[2] = 0;
-        idx += 2;
-    }
+    strncpy(info->tp_pid, pdu + idx, 2);
+    info->tp_pid[2] = 0;
+    idx += 2;
 
     // TP_DCS
-    if (idx + 2 <= pdu_len) {
-        strncpy(info->tp_dcs, pdu + idx, 2);
-        info->tp_dcs[2] = 0;
-        idx += 2;
-    }
-    
-    if (strcmp(info->tp_dcs, "00") == 0) {
-        strcpy(info->tp_dcs_desc, "7-bit Default Alphabet");
-        strcpy(info->sms_class, "0");
-        strcpy(info->alphabet, "7-bit");
-    } else if (strcmp(info->tp_dcs, "08") == 0) {
+    strncpy(info->tp_dcs, pdu + idx, 2);
+    info->tp_dcs[2] = 0;
+    idx += 2;
+    if (strcmp(info->tp_dcs, "08") == 0) {
         strcpy(info->tp_dcs_desc, "Uncompressed Text");
         strcpy(info->sms_class, "0");
         strcpy(info->alphabet, "UCS2(16)bit");
@@ -1706,405 +639,497 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     }
 
     // 时间戳
-    if (idx + 14 <= pdu_len) {
-        char ts[32] = {0};
-        strncpy(ts, pdu + idx, 14);
-        ts[14] = 0;
-        idx += 14;
-        char dt[64] = {0};
-        for (i = 0; i < 12 && i < (int)sizeof(ts)-1; i += 2) {
-            dt[i] = ts[i+1];
-            dt[i+1] = ts[i];
-        }
-        snprintf(info->timestamp, sizeof(info->timestamp), "%c%c/%c%c/%c%c %c%c:%c%c:%c%c",
-            dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8], dt[9], dt[10], dt[11]);
+    char ts[15] = {0};
+    strncpy(ts, pdu + idx, 14);
+    ts[14] = 0;
+    idx += 14;
+    char dt[32] = {0};
+    for (i = 0; i < 12; i += 2) {
+        dt[i] = ts[i+1];
+        dt[i+1] = ts[i];
     }
+    snprintf(info->timestamp, sizeof(info->timestamp), "%c%c/%c%c/%c%c %c%c:%c%c:%c%c",
+        dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8], dt[9], dt[10], dt[11]);
 
-    if (idx + 2 > pdu_len) return;
     int text_len_oct = 0;
     sscanf(pdu + idx, "%2x", &text_len_oct);
     idx += 2;
     info->text_len = text_len_oct;
 
-    // 根据TP-DCS决定解码方式，添加边界检查
-    if (strcmp(info->tp_dcs, "00") == 0 && idx < pdu_len) {
-        // 7-bit编码
-        int available_len = (pdu_len - idx) / 2;
-        decode_7bit_pdu(pdu + idx, (text_len_oct < available_len) ? text_len_oct : available_len, info->text, sizeof(info->text));
-    } else if (strcmp(info->tp_dcs, "08") == 0 && idx < pdu_len) {
-        // UCS2编码 - 修改2: 改进处理逻辑
-        int ucs2_len = text_len_oct * 2;
-        int available_len = pdu_len - idx;
-        int process_len = (ucs2_len < available_len) ? ucs2_len : available_len;
-        
-        if (process_len > 0) {
-            // 增大缓冲区以容纳更长的数据
-            char ucs2_hex[8192] = {0};
-            int copy_len = (process_len < 8191) ? process_len : 8191;
-            strncpy(ucs2_hex, pdu + idx, copy_len);
-            ucs2_hex[copy_len] = 0;
-            
-            // 直接使用改进的decode_pdu_ucs2函数
-            decode_pdu_ucs2(ucs2_hex, info->text, sizeof(info->text));
-        }
-    } else if (idx < pdu_len) {
-        // 默认处理方式（尝试作为简单十六进制处理）
-        int hex_len = text_len_oct * 2;
-        int available_len = pdu_len - idx;
-        int process_len = (hex_len < available_len) ? hex_len : available_len;
-        
-        if (process_len > 0 && process_len < sizeof(info->text) - 1) {
-            strncpy(info->text, pdu + idx, process_len);
-            info->text[process_len] = 0;
+    size_t pdu_total_len = strlen(pdu);
+    size_t remaining = pdu_total_len > (size_t)idx ? (pdu_total_len - (size_t)idx) : 0;
+    size_t expected_ud_hex_len = (size_t)text_len_oct * 2;
+    size_t ud_hex_len = expected_ud_hex_len;
+    if (ud_hex_len > remaining) ud_hex_len = remaining;
+
+    size_t ud_start_offset = 0;
+    if ((first_octet & 0x40) && ud_hex_len >= 2) {
+        unsigned int udhl = 0;
+        if (sscanf(pdu + idx, "%2x", &udhl) == 1) {
+            size_t header_hex = ((size_t)udhl + 1) * 2;
+            if (header_hex < ud_hex_len) {
+                ud_start_offset = header_hex;
+            }
         }
     }
+
+    const char *ud_hex_ptr = pdu + idx + (int)ud_start_offset;
+    size_t ud_hex_len_after = ud_hex_len > ud_start_offset ? (ud_hex_len - ud_start_offset) : 0;
+    char *ucs2_hex = (char*)malloc(ud_hex_len_after + 1);
+    if (!ucs2_hex) {
+        info->text[0] = 0;
+        return;
+    }
+    memcpy(ucs2_hex, ud_hex_ptr, ud_hex_len_after);
+    ucs2_hex[ud_hex_len_after] = 0;
+    k = 0;
+    for (i = 0; i + 3 < (int)ud_hex_len_after && k + 3 < (int)sizeof(info->text); i += 4) {
+        unsigned int ucs2;
+        if (sscanf(ucs2_hex + i, "%4x", &ucs2) != 1) break;
+        if (ucs2 < 0x80) {
+            info->text[k++] = (char)ucs2;
+        } else if (ucs2 < 0x800) {
+            info->text[k++] = 0xC0 | (ucs2 >> 6);
+            info->text[k++] = 0x80 | (ucs2 & 0x3F);
+        } else {
+            info->text[k++] = 0xE0 | (ucs2 >> 12);
+            info->text[k++] = 0x80 | ((ucs2 >> 6) & 0x3F);
+            info->text[k++] = 0x80 | (ucs2 & 0x3F);
+        }
+    }
+    info->text[k] = 0;
+    free(ucs2_hex);
 }
 
-// 修改3: 改进decode_pdu_ucs2函数以处理更长的内容
+// 为保持兼容性保留的旧函数
+static char last_sms_compat[256] = "";
+static time_t last_sms_time_compat = 0;
+
 void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen) {
     // 假设pdu内容全为UCS2编码的16进制字符串
     size_t len = strlen(pdu);
     size_t i = 0, j = 0;
-    
     // 兼容原逻辑：如果长度太短直接返回空
-    if (len < 4) { 
-        out[0] = 0; 
-        return; 
-    }
-    
-    // 清空输出缓冲区
-    memset(out, 0, outlen);
-    
-    while (i + 3 < len && j + 4 < outlen) {
+    if (len < 4) { out[0] = 0; return; }
+    while (i + 3 < len && j + 3 < outlen) {
         unsigned int ucs2;
-        // 确保我们有足够的字符来读取一个完整的UCS2字符(4个十六进制字符)
-        if (i + 4 > len) break;
-        
         if (sscanf(pdu + i, "%4x", &ucs2) != 1) break;
-        
-        // 跳过空字符但继续处理
-        if (ucs2 == 0) {
-            i += 4;
-            continue;
-        }
-        
+        if (ucs2 == 0) break;
         if (ucs2 < 0x80) {
-            // ASCII字符 (1字节)
             out[j++] = (char)ucs2;
         } else if (ucs2 < 0x800) {
-            // 2字节UTF-8
-            if (j + 1 < outlen) {
-                out[j++] = 0xC0 | (ucs2 >> 6);
-                out[j++] = 0x80 | (ucs2 & 0x3F);
-            } else {
-                break;
-            }
-        } else if (ucs2 < 0x10000) {
-            // 3字节UTF-8
-            if (j + 2 < outlen) {
-                out[j++] = 0xE0 | (ucs2 >> 12);
-                out[j++] = 0x80 | ((ucs2 >> 6) & 0x3F);
-                out[j++] = 0x80 | (ucs2 & 0x3F);
-            } else {
-                break;
-            }
-        } else if (ucs2 < 0x110000) {
-            // 4字节UTF-8
-            if (j + 3 < outlen) {
-                out[j++] = 0xF0 | (ucs2 >> 18);
-                out[j++] = 0x80 | ((ucs2 >> 12) & 0x3F);
-                out[j++] = 0x80 | ((ucs2 >> 6) & 0x3F);
-                out[j++] = 0x80 | (ucs2 & 0x3F);
-            } else {
-                break;
-            }
+            out[j++] = 0xC0 | (ucs2 >> 6);
+            out[j++] = 0x80 | (ucs2 & 0x3F);
+        } else {
+            out[j++] = 0xE0 | (ucs2 >> 12);
+            out[j++] = 0x80 | ((ucs2 >> 6) & 0x3F);
+            out[j++] = 0x80 | (ucs2 & 0x3F);
         }
         i += 4;
     }
     out[j] = 0;
 }
 
-// 发送钉钉消息接口（只支持text）
-void send_dingtalk_msg(const char *webhook, const char *txt, const char *keyword) {
-    // 构造钉钉 content 字段，并做严格JSON安全转义
-    char safe_txt[4096]; // 增加缓冲区大小以支持长短信
-    int i = 0, j = 0;
-    while (txt[i] && j < (int)sizeof(safe_txt) - 1) {
-        unsigned char c = (unsigned char)txt[i];
-        if (c == '"') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = '"'; }
-        } else if (c == '\\') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = '\\'; }
-        } else if (c == '\n') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = 'n'; }
-        } else if (c == '\r') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = 'r'; }
-        } else if (c == '\t') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = 't'; }
-        } else if (c < 0x20) {
-            // 其它不可见控制字符直接跳过
-        } else {
-            safe_txt[j++] = c;
-        }
-        i++;
-    }
-    safe_txt[j] = 0;
-    
-    // 构造消息内容，处理keyword为NULL的情况
-    char content[6144]; // 增加缓冲区大小
-    if (keyword) {
-        snprintf(content, sizeof(content), "%s\\n%s", keyword, safe_txt);
-    } else {
-        // 如果keyword为NULL，直接使用文本内容
-        snprintf(content, sizeof(content), "%s", safe_txt);
-    }
-    
-    // 构造完整 JSON
-    char json_msg[8192]; // 增加缓冲区大小
-    snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", content);
+static void form_url_escape(char *out, size_t outsz, const char *in) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t used = 0;
 
-    // 直接用 mbedtls HTTPS POST 发送 JSON
-    char *host = NULL, *path = NULL;
-    parse_url(webhook, &host, &path);
-    if (!host || !path) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        unsigned char c = (unsigned char)*in++;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            out[used++] = (char)c;
+        } else if (used + 3 < outsz) {
+            out[used++] = '%';
+            out[used++] = hex[c >> 4];
+            out[used++] = hex[c & 0x0f];
+        } else {
+            break;
+        }
     }
+    out[used] = 0;
+}
+
+static int replace_token(char *out, size_t outsz, const char *token,
+                         const char *value) {
+    size_t tlen = strlen(token);
+    size_t vlen = strlen(value ? value : "");
+    char *p = strstr(out, token);
+    size_t tail_len;
+    size_t used;
+
+    while (p) {
+        used = strlen(out);
+        tail_len = strlen(p + tlen);
+        if ((size_t)(p - out) + vlen + tail_len >= outsz)
+            return -1;
+        memmove(p + vlen, p + tlen, tail_len + 1);
+        memcpy(p, value ? value : "", vlen);
+        p = strstr(p + vlen, token);
+    }
+    return 0;
+}
+
+static int render_custom_body(const char *tmpl, const char *txt,
+                              char *out, size_t outsz) {
+    char json_txt[3072];
+    char url_txt[3072];
+
+    if (!tmpl || !tmpl[0] || !outsz)
+        return -1;
+    safe_copy(out, outsz, tmpl);
+    json_escape(json_txt, sizeof(json_txt), txt);
+    form_url_escape(url_txt, sizeof(url_txt), txt);
+    if (replace_token(out, outsz, "{{json_text}}", json_txt) < 0)
+        return -1;
+    if (replace_token(out, outsz, "{{url_text}}", url_txt) < 0)
+        return -1;
+    if (replace_token(out, outsz, "{{text}}", txt ? txt : "") < 0)
+        return -1;
+    return 0;
+}
+
+static int extract_bark_device_key(const char *url, char *out, size_t outsz) {
+    const char *p;
+    const char *end;
+    size_t len;
+
+    if (!url || !out || outsz == 0)
+        return -1;
+    out[0] = 0;
+    p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    p = strchr(p, '/');
+    if (!p || !p[1])
+        return -1;
+    p++;
+    if (strncmp(p, "push", 4) == 0 &&
+        (p[4] == 0 || p[4] == '?' || p[4] == '/' || p[4] == '#'))
+        return -1;
+    end = p;
+    while (*end && *end != '/' && *end != '?' && *end != '#')
+        end++;
+    len = (size_t)(end - p);
+    if (len == 0 || len >= outsz)
+        return -1;
+    memcpy(out, p, len);
+    out[len] = 0;
+    return 0;
+}
+
+static int build_webhook_payload(const char *webhook, const char *platform,
+                                 const char *txt,
+                                 const char *custom_ctype,
+                                 const char *custom_body,
+                                 char *payload, size_t payload_sz,
+                                 char *ctype, size_t ctype_sz) {
+    char safe_txt[3072];
+    char safe_key[512];
+    char enc_txt[3072];
+    const char *p = platform && platform[0] ? platform : "dingtalk";
+
+    if (!payload_sz || !ctype_sz)
+        return -1;
+    payload[0] = 0;
+    ctype[0] = 0;
+
+    if (strcmp(p, "serverchan") == 0) {
+        form_url_escape(enc_txt, sizeof(enc_txt), txt);
+        snprintf(ctype, ctype_sz, "application/x-www-form-urlencoded");
+        snprintf(payload, payload_sz, "title=Alice%%20Pusher&desp=%s", enc_txt);
+        return payload[0] ? 0 : -1;
+    }
+    if (strcmp(p, "telegram") == 0) {
+        form_url_escape(enc_txt, sizeof(enc_txt), txt);
+        snprintf(ctype, ctype_sz, "application/x-www-form-urlencoded");
+        snprintf(payload, payload_sz, "text=%s", enc_txt);
+        return payload[0] ? 0 : -1;
+    }
+    if (strcmp(p, "custom") == 0) {
+        const char *tmpl = custom_body && custom_body[0] ? custom_body :
+                           "{\"text\":\"{{json_text}}\"}";
+        snprintf(ctype, ctype_sz, "%s",
+                 custom_ctype && custom_ctype[0] ? custom_ctype :
+                 "application/json;charset=utf-8");
+        if (render_custom_body(tmpl, txt, payload, payload_sz) < 0)
+            return -1;
+        return payload[0] ? 0 : -1;
+    }
+
+    json_escape(safe_txt, sizeof(safe_txt), txt);
+    snprintf(ctype, ctype_sz, "application/json;charset=utf-8");
+    if (strcmp(p, "feishu") == 0) {
+        snprintf(payload, payload_sz,
+                 "{\"msg_type\":\"text\",\"content\":{\"text\":\"%s\"}}",
+                 safe_txt);
+    } else if (strcmp(p, "discord") == 0) {
+        snprintf(payload, payload_sz,
+                 "{\"content\":\"%s\"}",
+                 safe_txt);
+    } else if (strcmp(p, "bark") == 0) {
+        char bark_key[256];
+        if (extract_bark_device_key(webhook, bark_key, sizeof(bark_key)) < 0)
+            return -1;
+        json_escape(safe_key, sizeof(safe_key), bark_key);
+        snprintf(payload, payload_sz,
+                 "{\"title\":\"Alice Pusher\",\"body\":\"%s\",\"device_key\":\"%s\"}",
+                 safe_txt, safe_key);
+    } else {
+        snprintf(payload, payload_sz,
+                 "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}",
+                 safe_txt);
+    }
+    return payload[0] ? 0 : -1;
+}
+
+static int post_https_body(const char *webhook, const char *ctype,
+                           const char *payload, const char *platform) {
+    char *host = NULL, *path = NULL;
+    const char *request_path;
+    char request_buffer[8192];
+    unsigned char read_buf[1024];
+    int request_len;
     int ret = 0;
+    int rc = -1;
+    const char *port = "443";
+    const char *pers = "ssl_client";
     mbedtls_net_context server_fd;
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
-    const char *port = "443";
+
+    parse_url(webhook, &host, &path);
+    if (!host || !path) {
+        fprintf(stderr, "[WEBHOOK] invalid url\n");
+        goto cleanup_strings;
+    }
+    request_path = path;
+    if (platform && strcmp(platform, "bark") == 0)
+        request_path = "/push";
+
     mbedtls_net_init(&server_fd);
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
-    const char *pers = "ssl_client";
 
-    // 使用 goto 语句确保资源在所有路径下都被释放
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
+    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
+                                     &entropy, (const unsigned char *)pers,
+                                     strlen(pers))) != 0) {
         print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
-        goto cleanup;
+        goto cleanup_tls;
     }
-    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
+    if ((ret = mbedtls_net_connect(&server_fd, host, port,
+                                   MBEDTLS_NET_PROTO_TCP)) != 0) {
         print_mbedtls_error(ret, "mbedtls_net_connect");
-        goto cleanup;
+        goto cleanup_tls;
     }
-    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
         print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
-        goto cleanup;
+        goto cleanup_tls;
     }
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
     if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
         print_mbedtls_error(ret, "mbedtls_ssl_setup");
-        goto cleanup;
+        goto cleanup_tls;
     }
-    if ((ret = mbedtls_ssl_set_hostname(&ssl, host)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_set_hostname");
-        goto cleanup;
-    }
-    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-    if ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_handshake");
-        goto cleanup;
-    }
-
-    // 发送 HTTP POST 请求
-    char request[16384]; // 增加缓冲区大小
-    snprintf(request, sizeof(request), "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %lu\r\n\r\n%s",
-             path, host, strlen(json_msg), json_msg);
-    if ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request, strlen(request))) <= 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_write");
-        goto cleanup;
+    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send,
+                        mbedtls_net_recv, NULL);
+    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            print_mbedtls_error(ret, "mbedtls_ssl_handshake");
+            goto cleanup_tls;
+        }
     }
 
-    // 读取响应
-    unsigned char buffer[4096];
-    ret = mbedtls_ssl_read(&ssl, buffer, sizeof(buffer) - 1);
-    if (ret <= 0 && ret != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+    request_len = snprintf(request_buffer, sizeof(request_buffer),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: alice-pusher-bot/1.0\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        request_path, host, ctype, strlen(payload), payload);
+    if (request_len <= 0 || request_len >= (int)sizeof(request_buffer)) {
+        fprintf(stderr, "[WEBHOOK] request too large\n");
+        goto cleanup_tls;
+    }
+
+    printf("[WEBHOOK] platform=%s host=%s bytes=%zu\n",
+           platform ? platform : "dingtalk", host, strlen(payload));
+    while ((ret = mbedtls_ssl_write(&ssl,
+                                    (const unsigned char *)request_buffer,
+                                    (size_t)request_len)) <= 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            print_mbedtls_error(ret, "mbedtls_ssl_write");
+            goto cleanup_tls;
+        }
+    }
+
+    memset(read_buf, 0, sizeof(read_buf));
+    ret = mbedtls_ssl_read(&ssl, read_buf, sizeof(read_buf) - 1);
+    if (ret > 0)
+        printf("[WEBHOOK] response: %s\n", read_buf);
+    else if (ret < 0 &&
+             ret != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY &&
+             ret != MBEDTLS_ERR_SSL_WANT_READ)
         print_mbedtls_error(ret, "mbedtls_ssl_read");
-        goto cleanup;
-    }
+    rc = 0;
 
-cleanup:
-    // 确保在所有路径下都释放资源
-    free(host);
-    free(path);
-    mbedtls_ssl_close_notify(&ssl);
+cleanup_tls:
     mbedtls_net_free(&server_fd);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
+cleanup_strings:
+    if (host) free(host);
+    if (path) free(path);
+    return rc;
 }
 
-// 修改 extract_and_send_sms_from_log 函数，只匹配特定格式的短信信息
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword, const char *number) {
-    FILE *fp = fopen("/tmp/zte_log.txt", "r");
-    if (!fp) return;
-    char line[4096];
-    regex_t reg;
-    // 修改正则表达式，只匹配write(1, ...)格式的短信信息
-    regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
-    int line_num = 0;
-    time_t start_time = time(NULL);
-    
-    // PDU去重队列 - 用于防止相同PDU重复发送
-    static char pdu_sent_queue[50][2048];
-    static int pdu_sent_count = 0;
-    static int pdu_sent_head = 0;
-    
-    // 在函数开始处声明所有变量
-    sms_info_t info;
-    char *first_crlf, *pdu_start, *pdu_end;
-    char pdu[2048];
-    char *pdubegin, *pdu_trim, *pdutail;
-    size_t textlen;
-    int detection_idx, already_sent;
-    int i, idx;
-    char decoded_info[3072]; // 增加缓冲区大小
-    char msg[4096]; // 增加缓冲区大小
-    size_t pdu_len, pi;
-    int valid_pdu;
-    int is_long_sms_fragment = 0;
-    
-    // 检查临时存储中是否有需要处理的短信
-    sms_info_t combined_info;
-    char combined_pdu[16384]; // 增加缓冲区大小以容纳组合后的PDU
-    if (check_temp_storage_for_processing(&combined_info, combined_pdu, sizeof(combined_pdu))) {
-        printf("[DEBUG] Processing combined SMS from temp storage\n");
-        // 处理合并后的短信
-        textlen = strlen(combined_info.text);
-        if (textlen > 0) {
-            // 清理过期的检测条目
-            cleanup_detection_window();
-            
-            // 添加到连续检测窗口并检查是否达到3次
-            add_sms_to_detection_window(combined_info.sender, combined_info.timestamp, combined_info.text);
-            detection_idx = is_sms_in_detection_window(combined_info.sender, combined_info.timestamp, combined_info.text);
-            
-            // 检查是否在检测窗口中且计数达到3次
-            if (detection_idx != -1 && detection_window[detection_idx].count >= 1) {
-                // 检查是否已经发送过相同的PDU
-                already_sent = 0;
-                for (i = 0; i < pdu_sent_count; i++) {
-                    idx = (pdu_sent_head + i) % 50;
-                    if (strcmp(pdu_sent_queue[idx], combined_pdu) == 0) {
-                        already_sent = 1;
-                        printf("[DEBUG] skip already sent pdu: %s\n", combined_pdu);
+int send_webhook_msg(const char *webhook, const char *platform,
+                     const char *txt, const char *custom_ctype,
+                     const char *custom_body) {
+    char payload[4096];
+    char ctype[160];
+    const char *p = platform && platform[0] ? platform : "dingtalk";
+
+    if (!webhook || !webhook[0] || !txt)
+        return -1;
+    if (build_webhook_payload(webhook, p, txt, custom_ctype, custom_body,
+                              payload, sizeof(payload),
+                              ctype, sizeof(ctype)) < 0)
+        return -1;
+    return post_https_body(webhook, ctype, payload, p);
+}
+
+void send_dingtalk_msg(const char *webhook, const char *txt) {
+    (void)send_webhook_msg(webhook, "dingtalk", txt, NULL, NULL);
+}
+
+static void process_strace_line_for_sms(const char *line, const char *webhook,
+                                        const char *platform,
+                                        const char *custom_ctype,
+                                        const char *custom_body,
+                                        const char *headtxt,
+                                        const char *tailtxt) {
+    (void)headtxt;
+    (void)tailtxt;
+    char local[MAX_BUFFER_LEN];
+    strncpy(local, line, sizeof(local) - 1);
+    local[sizeof(local) - 1] = 0;
+
+    char *p = strstr(local, "+CMT: ");
+    if (p) {
+        char *first_crlf = strstr(p, "\\r\\n");
+        printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-local) : -1L);
+        if (first_crlf) {
+            char *pdu_start = first_crlf + 4;
+            printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-local));
+            char *pdu_end = strstr(pdu_start, "\\r\\n");
+            if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-local));
+            char pdu[2048] = "";
+            if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
+                strncpy(pdu, pdu_start, pdu_end - pdu_start);
+                pdu[pdu_end - pdu_start] = 0;
+            } else {
+                strncpy(pdu, pdu_start, sizeof(pdu)-1);
+                pdu[sizeof(pdu)-1] = 0;
+            }
+            printf("[DEBUG] pdu_raw: %s\n", pdu);
+            printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
+            char *pdubegin = pdu;
+            while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
+            char *pdu_trim = pdubegin;
+            char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
+            while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
+            printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
+            printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
+            if (pdu_trim[0]) {
+                int valid_pdu = 1;
+                size_t pdu_len = strlen(pdu_trim);
+                size_t pi;
+                if (pdu_len < 20) valid_pdu = 0;
+                for (pi = 0; pi < pdu_len; pi++) {
+                    char c = pdu_trim[pi];
+                    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                        valid_pdu = 0;
                         break;
                     }
                 }
-                
-                // 如果未发送过，则发送并添加到已发送队列
-                if (!already_sent) {
-                    // 处理PDU，显示解码后的信息和原始PDU
-                    snprintf(decoded_info, sizeof(decoded_info),
-                        "短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
-                        combined_info.smsc[0] ? combined_info.smsc : "N/A",
-                        combined_info.sender[0] ? combined_info.sender : "N/A",
-                        combined_info.timestamp[0] ? combined_info.timestamp : "N/A",
-                        combined_info.text);
-                    
-                    // 构造消息内容，确保headtxt在keyword之前，并包含设备编号
-                    char full_msg[8192]; // 增加缓冲区大小
-                    char headtxt_with_number[2048]; // 增加缓冲区大小
-                    
-                    // 如果提供了number参数，将其添加到headtxt中
-                    if (number) {
-                        if (headtxt) {
-                            snprintf(headtxt_with_number, sizeof(headtxt_with_number), "[设备编号:%s] %s", number, headtxt);
+                if (valid_pdu) {
+                    sms_info_t info;
+                    decode_pdu(pdu_trim, &info);
+                    printf("[DEBUG] sms_decoded: %s\n", info.text);
+                    printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
+                    size_t textlen = strlen(info.text);
+                    if (textlen > 0) {
+                        if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
+                            add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
+                            char msg[1024];
+                            snprintf(msg, sizeof(msg),
+                                "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
+                                device_msisdn[0] ? device_msisdn : "N/A",
+                                info.smsc[0] ? info.smsc : "N/A",
+                                info.sender[0] ? info.sender : "N/A",
+                                info.timestamp[0] ? info.timestamp : "N/A",
+                                info.text);
+                            send_webhook_msg(webhook, platform, msg,
+                                             custom_ctype, custom_body);
                         } else {
-                            snprintf(headtxt_with_number, sizeof(headtxt_with_number), "[设备编号:%s]", number);
-                        }
-                    } else {
-                        // 未提供number参数时添加SIM卡号信息
-                        char sim_info[512]; // 增加缓冲区大小
-                        if (global_sim_number[0]) {
-                            snprintf(sim_info, sizeof(sim_info), "[SIM卡号:%s]", global_sim_number);
-                        } else if (sim_number_initialized) {
-                            // SIM卡号获取失败或不支持
-                            snprintf(sim_info, sizeof(sim_info), "[SIM卡号:获取失败，设备不支持，请进行手动添加]");
-                        }
-                        
-                        if (headtxt) {
-                            if (sim_info[0]) {
-                                snprintf(headtxt_with_number, sizeof(headtxt_with_number), "%s %s", sim_info, headtxt);
-                            } else {
-                                strncpy(headtxt_with_number, headtxt, sizeof(headtxt_with_number) - 1);
-                            }
-                        } else if (sim_info[0]) {
-                            strncpy(headtxt_with_number, sim_info, sizeof(headtxt_with_number) - 1);
+                            printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
                         }
                     }
-                    
-                    // if (headtxt_with_number[0]) {
-                    //     snprintf(full_msg, sizeof(full_msg),
-                    //         "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                    //         headtxt_with_number,
-                    //         decoded_info,
-                    //         combined_pdu);
-                    // } else {
-                    //     snprintf(full_msg, sizeof(full_msg),
-                    //         "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                    //         decoded_info,
-                    //         combined_pdu);
-                    // }
-                    
-                    // 过滤垃圾字符
-                    char *filtered_msg = filter_garbage_chars(full_msg);
-                    printf("[DEBUG] After filtering: %s\n", filtered_msg);
-                    send_dingtalk_msg(webhook, filtered_msg , keyword);
-                    free(filtered_msg); // 释放filter_garbage_chars分配的内存
-
-                    // 使用truncate强制清空文件（0字节填充）
-                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
-                        perror("truncate /tmp/zte_log.txt");
-                    }
-                    
-                    // 添加到已发送PDU队列
-                    if (pdu_sent_count < 50) {
-                        strcpy(pdu_sent_queue[(pdu_sent_head + pdu_sent_count) % 50], combined_pdu);
-                        pdu_sent_count++;
-                    } else {
-                        strcpy(pdu_sent_queue[pdu_sent_head], combined_pdu);
-                        pdu_sent_head = (pdu_sent_head + 1) % 50;
-                    }
+                } else {
+                    printf("[DEBUG] skip invalid pdu: %s\n", pdu_trim);
                 }
-            } else {
-                printf("[DEBUG] sms not yet confirmed (count=%d): Sender=%s, TimeStamp=%s, Text=%s\n", 
-                       detection_idx != -1 ? detection_window[detection_idx].count : 0,
-                       combined_info.sender, combined_info.timestamp, combined_info.text);
             }
+        } else {
+            printf("[DEBUG] first_crlf not found after +CMT:\n");
         }
     }
-    
+}
+
+// 兼容旧日志文件提取入口，保留钉钉默认格式。
+void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt) {
+    FILE *fp = fopen("/tmp/zte_log.txt", "r");
+    if (!fp) return;
+    char line[2048];
+    regex_t reg;
+    // 匹配如: write(16, "...", 91) = 91，兼容C regex语法，不用\s和\)
+    regcomp(&reg, "^[ \t]*write\\([0-9]+, \".*\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
+    int line_num = 0;
     while (fgets(line, sizeof(line), fp)) {
-        // 添加超时检查，防止函数执行过久
-        if (time(NULL) - start_time > 30) {
-            printf("[WARN] extract_and_send_sms_from_log timeout\n");
-            break;
-        }
-        
         line_num++;
-        int is_read = (regexec(&reg, line, 0, NULL, 0) == 0);
+        int is_write = (regexec(&reg, line, 0, NULL, 0) == 0);
         char *p = strstr(line, "+CMT: ");
-        if (!p) {
-            // 尝试另一种格式
-            p = strstr(line, "\\+CMT: ");
-        }
-        
+        // printf("[DEBUG] line %d: %s", line_num, line);
+        // printf("[DEBUG] is_write: %d\n", is_write);
+        // printf("[DEBUG] +CMT: pos: %ld\n", p ? (long)(p-line) : -1L);
         if (p) {
-            first_crlf = strstr(p, "\\r\\n");
+            // 修改这里：在strace输出中，换行符是字符串"\r\n"而不是实际的\r\n字符
+            char *first_crlf = strstr(p, "\\r\\n");
+            printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-line) : -1L);
             if (first_crlf) {
-                pdu_start = first_crlf + 4;
-                pdu_end = strstr(pdu_start, "\\r\\n");
-                memset(pdu, 0, sizeof(pdu));  // 清空缓冲区
+                // 修改这里：跳过"\r\n"字符串（4个字符）
+                char *pdu_start = first_crlf + 4;
+                printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-line));
+                // 同样查找结束标记也需要查找字符串"\r\n"
+                char *pdu_end = strstr(pdu_start, "\\r\\n");
+                if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-line));
+                char pdu[2048] = "";
                 if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
                     strncpy(pdu, pdu_start, pdu_end - pdu_start);
                     pdu[pdu_end - pdu_start] = 0;
@@ -2112,15 +1137,20 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                     strncpy(pdu, pdu_start, sizeof(pdu)-1);
                     pdu[sizeof(pdu)-1] = 0;
                 }
-                pdubegin = pdu;
+                printf("[DEBUG] pdu_raw: %s\n", pdu);
+                printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
+                char *pdubegin = pdu;
                 while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
-                pdu_trim = pdubegin;
-                pdutail = pdu_trim + strlen(pdu_trim) - 1;
+                char *pdu_trim = pdubegin;
+                char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
                 while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
+                printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
+                printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
                 if (pdu_trim[0]) {
                     // 过滤异常PDU：长度至少20且全为十六进制字符
-                    valid_pdu = 1;
-                    pdu_len = strlen(pdu_trim);
+                    int valid_pdu = 1;
+                    size_t pdu_len = strlen(pdu_trim);
+                    size_t pi;
                     if (pdu_len < 20) valid_pdu = 0;
                     for (pi = 0; pi < pdu_len; pi++) {
                         char c = pdu_trim[pi];
@@ -2130,176 +1160,26 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                         }
                     }
                     if (valid_pdu) {
-                        // 先进行PDU解码以获取基本信息
-                        printf("[DEBUG] pdu_trim - %s\n",pdu_trim), 
-                        memset(&info, 0, sizeof(info));
+                        sms_info_t info;
                         decode_pdu(pdu_trim, &info);
-                        textlen = strlen(info.text);
-                        
-                        // 添加调试信息输出，显示解码后的中文信息
-                        printf("[DEBUG] Decoded SMS - Sender: %s, Timestamp: %s, Text: %s\n", 
-                               info.sender, info.timestamp, info.text);
-                        
-                        // 清理过期的PDU片段
-                        cleanup_pdu_fragment_queue();
-                        cleanup_long_sms_tracker();
-                        cleanup_temp_storage();
-                        
-                        // 检查当前PDU是否是之前完整PDU的片段
-                        if (is_pdu_fragment_in_queue(info.sender, info.timestamp, pdu_trim)) {
-                            printf("[DEBUG] Skipping fragment PDU as it's part of a complete PDU already processed\n");
-                            continue; // 如果是片段，跳过处理
-                        }
-                        
-                        // 检查是否是已知长短信的片段
-                        if (is_known_long_sms(info.sender, info.timestamp)) {
-                            printf("[DEBUG] Skipping known long SMS fragment from sender %s at %s\n", 
-                                   info.sender, info.timestamp);
-                            continue; // 如果是已知长短信的片段，跳过处理
-                        }
-                        
-                        // 将当前PDU添加到片段队列中
-                        add_pdu_fragment_to_queue(info.sender, info.timestamp, pdu_trim);
-                        
-                        // 检查是否为长短信片段
-                        unsigned char ref, max, seq;
-                        is_long_sms_fragment = extract_long_sms_info(pdu_trim, &ref, &max, &seq);
-                        if (is_long_sms_fragment) {
-                            printf("[DEBUG] Long SMS fragment detected - Ref: %d, Max: %d, Seq: %d\n", ref, max, seq);
-                            // 添加到跟踪器，后续相同发件人和时间戳的片段会被过滤
-                            add_long_sms_to_tracker(info.sender, info.timestamp);
-                            
-                            // 添加长短信片段到队列
-                            add_long_sms_fragment(info.sender, info.timestamp, ref, max, seq, info.text, pdu_trim);
-                            
-                            // 检查是否可以重组长短信
-                            if (can_reassemble_long_sms(info.sender, info.timestamp, ref, max)) {
-                                char reassembled_text[8192];
-                                char combined_pdu[16384];
-                                if (reassemble_long_sms(info.sender, info.timestamp, ref, max, reassembled_text, sizeof(reassembled_text), combined_pdu, sizeof(combined_pdu))) {
-                                    printf("[DEBUG] Successfully reassembled long SMS: %s\n", reassembled_text);
-                                    printf("[DEBUG] Combined PDU: %s\n", combined_pdu);
-                                    // 使用重组后的完整短信内容
-                                    strncpy(info.text, reassembled_text, sizeof(info.text) - 1);
-                                    info.text[sizeof(info.text) - 1] = '\0';
-                                    textlen = strlen(info.text);
-                                    
-                                    // 清理已处理的片段，避免重复处理
-                                    cleanup_processed_long_sms_fragments(info.sender, info.timestamp, ref, max);
-                                }
+                        printf("[DEBUG] sms_decoded: %s\n", info.text);
+                        printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
+                        size_t textlen = strlen(info.text);
+                        if (textlen > 0) { // 只推送有内容的短信
+                            // 新去重机制：Sender+TimeStamp+Text三元组唯一
+                            if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
+                                add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
+                                char msg[1024];
+                                snprintf(msg, sizeof(msg),
+                                    "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
+                                    device_msisdn[0] ? device_msisdn : "N/A",
+                                    info.smsc[0] ? info.smsc : "N/A",
+                                    info.sender[0] ? info.sender : "N/A",
+                                    info.timestamp[0] ? info.timestamp : "N/A",
+                                    info.text);
+                                send_dingtalk_msg(webhook, msg);
                             } else {
-                                printf("[DEBUG] Long SMS not yet complete, waiting for more fragments\n");
-                                continue; // 等待更多片段
-                            }
-                        } else {
-                            // 不是长短信片段，添加到临时存储中等待5秒超时合并
-                            printf("[DEBUG] Adding SMS to temp storage for 5-second check cycle\n");
-                            add_sms_to_temp_storage(info.sender, info.timestamp, info.text, pdu_trim);
-                            continue; // 等待周期检查
-                        }
-                        
-                        if (textlen > 0) {
-                            // 清理过期的检测条目
-                            cleanup_detection_window();
-                            
-                            // 添加到连续检测窗口并检查是否达到3次
-                            add_sms_to_detection_window(info.sender, info.timestamp, info.text);
-                            detection_idx = is_sms_in_detection_window(info.sender, info.timestamp, info.text);
-                            
-                            // 检查是否在检测窗口中且计数达到3次
-                            if (detection_idx != -1 && detection_window[detection_idx].count >= 3) {
-                                // 检查是否已经发送过相同的PDU
-                                already_sent = 0;
-                                for (i = 0; i < pdu_sent_count; i++) {
-                                    idx = (pdu_sent_head + i) % 50;
-                                    if (strcmp(pdu_sent_queue[idx], pdu_trim) == 0) {
-                                        already_sent = 1;
-                                        printf("[DEBUG] skip already sent pdu: %s\n", pdu_trim);
-                                        break;
-                                    }
-                                }
-                                
-                                // 如果未发送过，则发送并添加到已发送队列
-                                if (!already_sent) {
-
-                                    // 处理PDU，显示解码后的信息和原始PDU
-                                    
-                                    snprintf(decoded_info, sizeof(decoded_info),
-                                        "短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
-                                        // info.smsc[0] ? info.smsc : "N/A",
-                                        info.sender[0] ? info.sender : "N/A",
-                                        info.timestamp[0] ? info.timestamp : "N/A",
-                                        info.text);
-                                    
-                                    // 构造消息内容，确保headtxt在keyword之前，并包含设备编号
-                                    char full_msg[4096]; // 增加缓冲区大小
-                                    char headtxt_with_number[2048]; // 增加缓冲区大小
-                                    
-                                    // 如果提供了number参数，将其添加到headtxt中
-                                    if (number) {
-                                        if (headtxt) {
-                                            snprintf(headtxt_with_number, sizeof(headtxt_with_number), "[设备编号:%s] %s", number, headtxt);
-                                        } else {
-                                            snprintf(headtxt_with_number, sizeof(headtxt_with_number), "[设备编号:%s]", number);
-                                        }
-                                    } else {
-                                        // 未提供number参数时添加SIM卡号信息
-                                        char sim_info[512]; // 增加缓冲区大小
-                                        if (global_sim_number[0]) {
-                                            snprintf(sim_info, sizeof(sim_info), "[SIM卡号:%s]", global_sim_number);
-                                        } else if (sim_number_initialized) {
-                                            // SIM卡号获取失败或不支持
-                                            snprintf(sim_info, sizeof(sim_info), "[SIM卡号:获取失败，设备不支持，请进行手动添加]");
-                                        }
-                                        
-                                        if (headtxt) {
-                                            if (sim_info[0]) {
-                                                snprintf(headtxt_with_number, sizeof(headtxt_with_number), "%s %s", sim_info, headtxt);
-                                            } else {
-                                                strncpy(headtxt_with_number, headtxt, sizeof(headtxt_with_number) - 1);
-                                            }
-                                        } else if (sim_info[0]) {
-                                            strncpy(headtxt_with_number, sim_info, sizeof(headtxt_with_number) - 1);
-                                        }
-                                    }
-                                    
-                                    // if (headtxt_with_number[0]) {
-                                    //     snprintf(full_msg, sizeof(full_msg),
-                                    //         "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                                    //         headtxt_with_number,
-                                    //         decoded_info,
-                                    //         pdu_trim);
-                                    // } else {
-                                    //     snprintf(full_msg, sizeof(full_msg),
-                                    //         "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                                    //         decoded_info,
-                                    //         pdu_trim);
-                                    // }
-                                    
-                                    // 过滤垃圾字符
-                                    char *filtered_msg = filter_garbage_chars(full_msg);
-                                    printf("[DEBUG] After filtering: %s\n", filtered_msg);
-                                    send_dingtalk_msg(webhook, filtered_msg, keyword);
-                                    free(filtered_msg); // 释放filter_garbage_chars分配的内存
-
-                                    // 使用truncate强制清空文件（0字节填充）
-                                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
-                                        perror("truncate /tmp/zte_log.txt");
-                                    }
-                                    
-                                    // 添加到已发送PDU队列
-                                    if (pdu_sent_count < 50) {
-                                        strcpy(pdu_sent_queue[(pdu_sent_head + pdu_sent_count) % 50], pdu_trim);
-                                        pdu_sent_count++;
-                                    } else {
-                                        strcpy(pdu_sent_queue[pdu_sent_head], pdu_trim);
-                                        pdu_sent_head = (pdu_sent_head + 1) % 50;
-                                    }
-                                }
-                            } else {
-                                printf("[DEBUG] sms not yet confirmed (count=%d): Sender=%s, TimeStamp=%s, Text=%s\n", 
-                                       detection_idx != -1 ? detection_window[detection_idx].count : 0,
-                                       info.sender, info.timestamp, info.text);
+                                printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
                             }
                         }
                     } else {
@@ -2362,34 +1242,1720 @@ void signal_handler(int sig) {
         }
     }
     
-    // 强制杀死监控进程
-    if (monitor_pid > 0) {
-        kill(monitor_pid, SIGTERM);
-        usleep(100*1000);
-        if (kill(monitor_pid, 0) == 0) {
-            kill(monitor_pid, SIGKILL);
-        }
-    }
-    
     exit(0);
 }
 
+typedef struct {
+    char webhook[1024];
+    char platform[32];
+    char custom_ctype[128];
+    char custom_body[2048];
+    char num[128];
+    char headtxt[256];
+    char tailtxt[256];
+    int port;
+} web_config_t;
+
+typedef struct {
+    int run_ready;
+    int bin_ready;
+    int script_ready;
+    int hook_ready;
+} autostart_status_t;
+
+static void safe_copy(char *dst, size_t dstsz, const char *src) {
+    if (!dstsz) return;
+    if (!src) src = "";
+    strncpy(dst, src, dstsz - 1);
+    dst[dstsz - 1] = 0;
+}
+
+static const char *normalize_platform(const char *platform) {
+    if (!platform || !platform[0]) return "dingtalk";
+    if (strcmp(platform, "dingtalk") == 0) return "dingtalk";
+    if (strcmp(platform, "feishu") == 0) return "feishu";
+    if (strcmp(platform, "wecom") == 0) return "wecom";
+    if (strcmp(platform, "serverchan") == 0) return "serverchan";
+    if (strcmp(platform, "discord") == 0) return "discord";
+    if (strcmp(platform, "telegram") == 0) return "telegram";
+    if (strcmp(platform, "bark") == 0) return "bark";
+    if (strcmp(platform, "custom") == 0) return "custom";
+    return "dingtalk";
+}
+
+static const char *platform_label(const char *platform) {
+    platform = normalize_platform(platform);
+    if (strcmp(platform, "feishu") == 0) return "飞书";
+    if (strcmp(platform, "wecom") == 0) return "企业微信";
+    if (strcmp(platform, "serverchan") == 0) return "Server 酱";
+    if (strcmp(platform, "discord") == 0) return "Discord";
+    if (strcmp(platform, "telegram") == 0) return "Telegram Bot";
+    if (strcmp(platform, "bark") == 0) return "Bark";
+    if (strcmp(platform, "custom") == 0) return "自定义";
+    return "钉钉";
+}
+
+static const char *detect_platform_from_url(const char *url) {
+    if (!url) return "dingtalk";
+    if (strstr(url, "open.feishu.cn") || strstr(url, "feishu.cn/"))
+        return "feishu";
+    if (strstr(url, "qyapi.weixin.qq.com") ||
+        strstr(url, "work.weixin.qq.com"))
+        return "wecom";
+    if (strstr(url, "sctapi.ftqq.com") || strstr(url, "sc.ftqq.com"))
+        return "serverchan";
+    if (strstr(url, "discord.com/api/webhooks/") ||
+        strstr(url, "discordapp.com/api/webhooks/"))
+        return "discord";
+    if (strstr(url, "api.telegram.org/bot"))
+        return "telegram";
+    if (strstr(url, "api.day.app"))
+        return "bark";
+    return "dingtalk";
+}
+
+static const char *selected_attr(const char *platform, const char *value) {
+    return strcmp(normalize_platform(platform), value) == 0 ? " selected" : "";
+}
+
+static void strip_line(char *s) {
+    size_t len;
+    if (!s) return;
+    len = strlen(s);
+    while (len && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
+        s[--len] = 0;
+    }
+}
+
+static void remove_newlines(char *s) {
+    while (s && *s) {
+        if (*s == '\r' || *s == '\n')
+            *s = ' ';
+        s++;
+    }
+}
+
+static void config_escape(char *out, size_t outsz, const char *in) {
+    size_t used = 0;
+
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        unsigned char c = (unsigned char)*in++;
+        if (c == '\\' || c == '\n' || c == '\r') {
+            if (used + 2 >= outsz) break;
+            out[used++] = '\\';
+            out[used++] = c == '\n' ? 'n' : (c == '\r' ? 'r' : '\\');
+        } else {
+            out[used++] = (char)c;
+        }
+    }
+    out[used] = 0;
+}
+
+static void config_unescape(char *out, size_t outsz, const char *in) {
+    size_t used = 0;
+
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        char c = *in++;
+        if (c == '\\' && *in) {
+            char n = *in++;
+            if (n == 'n') c = '\n';
+            else if (n == 'r') c = '\r';
+            else if (n == '\\') c = '\\';
+            else {
+                if (used + 2 >= outsz) break;
+                out[used++] = '\\';
+                c = n;
+            }
+        }
+        out[used++] = c;
+    }
+    out[used] = 0;
+}
+
+static int mkdir_p(const char *path) {
+    char tmp[512];
+    char *p;
+
+    safe_copy(tmp, sizeof(tmp), path);
+    if (!tmp[0]) return -1;
+    for (p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        mkdir(tmp, 0755);
+        *p = '/';
+    }
+    if (mkdir(tmp, 0755) < 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+static int mkdir_parent_file(const char *path) {
+    char tmp[512];
+    char *slash;
+
+    safe_copy(tmp, sizeof(tmp), path);
+    slash = strrchr(tmp, '/');
+    if (!slash) return 0;
+    *slash = 0;
+    if (!tmp[0]) return 0;
+    return mkdir_p(tmp);
+}
+
+static char *read_file_alloc(const char *path, size_t max_size, size_t *len_out) {
+    struct stat st;
+    char *buf;
+    int fd;
+    size_t off = 0;
+
+    if (stat(path, &st) < 0 || st.st_size < 0 ||
+        (size_t)st.st_size > max_size)
+        return NULL;
+    buf = (char *)malloc((size_t)st.st_size + 1);
+    if (!buf)
+        return NULL;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        free(buf);
+        return NULL;
+    }
+    while (off < (size_t)st.st_size) {
+        ssize_t n = read(fd, buf + off, (size_t)st.st_size - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            free(buf);
+            return NULL;
+        }
+        if (n == 0) break;
+        off += (size_t)n;
+    }
+    close(fd);
+    buf[off] = 0;
+    if (len_out) *len_out = off;
+    return buf;
+}
+
+static int file_contains(const char *path, const char *needle) {
+    char *buf = read_file_alloc(path, 128 * 1024, NULL);
+    int found;
+
+    if (!buf) return 0;
+    found = strstr(buf, needle) != NULL;
+    free(buf);
+    return found;
+}
+
+static void shell_quote(FILE *fp, const char *s) {
+    fputc('\'', fp);
+    for (; s && *s; s++) {
+        if (*s == '\'')
+            fputs("'\\''", fp);
+        else
+            fputc(*s, fp);
+    }
+    fputc('\'', fp);
+}
+
+static int write_all_fd(int fd, const char *buf, size_t len) {
+    while (len) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = EIO;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int path_is_regular_readable(const char *path) {
+    struct stat st;
+
+    if (!path || !path[0]) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (stat(path, &st) < 0)
+        return 0;
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return 0;
+    }
+    return access(path, R_OK) == 0;
+}
+
+static int path_is_same_file(const char *a, const char *b) {
+    struct stat sa, sb;
+
+    if (!a || !b || stat(a, &sa) < 0 || stat(b, &sb) < 0)
+        return 0;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+static int copy_regular_file(const char *src, const char *dst, mode_t mode) {
+    unsigned char buf[16384];
+    char tmp[PATH_MAX];
+    struct stat st;
+    ssize_t n;
+    int in = -1;
+    int out = -1;
+    int saved_errno;
+    int rc = -1;
+
+    if (!path_is_regular_readable(src))
+        return -1;
+    if (stat(src, &st) < 0 || !S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (path_is_same_file(src, dst))
+        return chmod(dst, mode);
+    if (mkdir_parent_file(dst) < 0)
+        return -1;
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", dst, (long)getpid()) >=
+        (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    in = open(src, O_RDONLY);
+    if (in < 0) goto out;
+    out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (out < 0) goto out;
+    for (;;) {
+        n = read(in, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            goto out;
+        }
+        if (n == 0) break;
+        if (write_all_fd(out, (const char *)buf, (size_t)n) < 0)
+            goto out;
+    }
+    if (fsync(out) < 0) goto out;
+    if (close(out) < 0) {
+        out = -1;
+        goto out;
+    }
+    out = -1;
+    if (chmod(tmp, mode) < 0) goto out;
+    if (rename(tmp, dst) < 0) goto out;
+    rc = 0;
+
+out:
+    saved_errno = errno;
+    if (out >= 0) close(out);
+    if (in >= 0) close(in);
+    if (rc < 0) unlink(tmp);
+    errno = saved_errno;
+    return rc;
+}
+
+static int current_exe_path(char *out, size_t outsz) {
+    ssize_t n;
+
+    if (!out || outsz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = readlink("/proc/self/exe", out, outsz - 1);
+    if (n < 0)
+        return -1;
+    out[n] = 0;
+    return 0;
+}
+
+static void get_autostart_status(autostart_status_t *st) {
+    memset(st, 0, sizeof(*st));
+    st->run_ready = access(DEFAULT_RUN_PATH, R_OK) == 0;
+    st->bin_ready = access(DEFAULT_BIN_PATH, X_OK) == 0;
+    st->script_ready = access(DEFAULT_AUTOSTART_SCRIPT, R_OK) == 0;
+    st->hook_ready = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN) &&
+                     file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_END);
+}
+
+static void remount_userdata_rw(void) {
+    system("mount -o remount,rw,exec /mnt/userdata 2>/dev/null || "
+           "mount -o remount,rw /mnt/userdata 2>/dev/null");
+}
+
+static void remount_root_rw(void) {
+    system("mount -o remount,rw / 2>/dev/null; "
+           "mount -o remount,rw /dev/root / 2>/dev/null");
+}
+
+static void remount_root_ro(void) {
+    system("sync; mount -o remount,ro / 2>/dev/null; "
+           "mount -o remount,ro /dev/root / 2>/dev/null");
+}
+
+static int install_autostart_payload(int *payload_kind) {
+    const char *run_src;
+    char exe[PATH_MAX];
+    int run_errno = 0;
+
+    if (payload_kind) *payload_kind = 0;
+    remount_userdata_rw();
+
+    run_src = getenv("ALICE_PUSHER_RUN_SOURCE");
+    if (path_is_regular_readable(run_src)) {
+        if (copy_regular_file(run_src, DEFAULT_RUN_PATH, 0755) == 0) {
+            if (payload_kind) *payload_kind = 1;
+            sync();
+            return 0;
+        }
+        run_errno = errno;
+    }
+
+    if (current_exe_path(exe, sizeof(exe)) == 0 &&
+        path_is_regular_readable(exe)) {
+        if (copy_regular_file(exe, DEFAULT_BIN_PATH, 0755) == 0) {
+            if (payload_kind) *payload_kind = 2;
+            sync();
+            return 0;
+        }
+    }
+
+    if (run_errno)
+        errno = run_errno;
+    return -1;
+}
+
+static void write_autostart_exec_block(FILE *fp, const char *var,
+                                       int use_shell) {
+    fprintf(fp, "if [ %s \"$%s\" ]; then\n", use_shell ? "-r" : "-x", var);
+    fprintf(fp, "\texec ");
+    if (use_shell)
+        fprintf(fp, "/bin/sh ");
+    fprintf(fp, "\"$%s\" -w\n", var);
+    fprintf(fp, "fi\n");
+}
+
+static int write_autostart_script(void) {
+    int fd;
+    int payload_kind = 0;
+    FILE *fp;
+
+    if (install_autostart_payload(&payload_kind) < 0)
+        return -1;
+    if (mkdir_parent_file(DEFAULT_AUTOSTART_SCRIPT) < 0)
+        return -1;
+    fd = open(DEFAULT_AUTOSTART_SCRIPT,
+              O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0)
+        return -1;
+    fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        return -1;
+    }
+
+    fprintf(fp, "#!/bin/sh\n");
+    fprintf(fp, "# generated by alice-pusher-bot\n");
+    fprintf(fp, "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n");
+    fprintf(fp, "mount -o remount,exec /tmp 2>/dev/null || true\n");
+    fprintf(fp, "mount -o remount,rw,exec /mnt/userdata 2>/dev/null || mount -o remount,rw /mnt/userdata 2>/dev/null || true\n");
+    fprintf(fp, "RUN=");
+    shell_quote(fp, DEFAULT_RUN_PATH);
+    fprintf(fp, "\nBIN=");
+    shell_quote(fp, DEFAULT_BIN_PATH);
+    fprintf(fp, "\n");
+    if (payload_kind == 2) {
+        write_autostart_exec_block(fp, "BIN", 0);
+        write_autostart_exec_block(fp, "RUN", 1);
+    } else {
+        write_autostart_exec_block(fp, "RUN", 1);
+        write_autostart_exec_block(fp, "BIN", 0);
+    }
+    fprintf(fp, "echo \"missing alice-pusher-bot startup payload\" >&2\n");
+    fprintf(fp, "exit 127\n");
+    if (fclose(fp) != 0)
+        return -1;
+    return chmod(DEFAULT_AUTOSTART_SCRIPT, 0755);
+}
+
+static int install_autostart_hook(void) {
+    FILE *fp;
+    int has_begin = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN);
+    int has_end = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_END);
+
+    if (has_begin && has_end)
+        return 0;
+    if (has_begin || has_end) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    remount_root_rw();
+    fp = fopen(DEFAULT_AUTOSTART_RC, "a");
+    if (!fp) {
+        remount_root_ro();
+        return -1;
+    }
+    fprintf(fp, "\n%s\n", AUTOSTART_BEGIN);
+    fprintf(fp, "if [ -f %s ]; then\n", DEFAULT_AUTOSTART_SCRIPT);
+    fprintf(fp, "\t/bin/sh %s >/tmp/alice_pusher_autostart.out 2>/tmp/alice_pusher_autostart.err &\n",
+            DEFAULT_AUTOSTART_SCRIPT);
+    fprintf(fp, "fi\n");
+    fprintf(fp, "%s\n", AUTOSTART_END);
+    if (fclose(fp) != 0) {
+        remount_root_ro();
+        return -1;
+    }
+    sync();
+    remount_root_ro();
+    return 0;
+}
+
+static int remove_autostart_hook(void) {
+    char *buf;
+    char *begin;
+    char *end;
+    char tmp_path[] = DEFAULT_AUTOSTART_RC ".alice_pusher_tmp";
+    struct stat st;
+    size_t len;
+    int fd;
+    int rc = -1;
+
+    buf = read_file_alloc(DEFAULT_AUTOSTART_RC, 128 * 1024, &len);
+    if (!buf)
+        return file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN) ? -1 : 0;
+    begin = strstr(buf, AUTOSTART_BEGIN);
+    if (!begin) {
+        free(buf);
+        return 0;
+    }
+    end = strstr(begin, AUTOSTART_END);
+    if (!end) {
+        free(buf);
+        errno = EINVAL;
+        return -1;
+    }
+    if (begin > buf && begin[-1] == '\n')
+        begin--;
+    end += strlen(AUTOSTART_END);
+    if (*end == '\r') end++;
+    if (*end == '\n') end++;
+
+    remount_root_rw();
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0744);
+    if (fd < 0) goto out;
+    if (write_all_fd(fd, buf, (size_t)(begin - buf)) < 0) goto out_close;
+    if (write_all_fd(fd, end, len - (size_t)(end - buf)) < 0) goto out_close;
+    if (close(fd) < 0) {
+        fd = -1;
+        goto out;
+    }
+    fd = -1;
+    if (stat(DEFAULT_AUTOSTART_RC, &st) == 0)
+        chmod(tmp_path, st.st_mode & 0777);
+    if (rename(tmp_path, DEFAULT_AUTOSTART_RC) < 0) goto out;
+    sync();
+    rc = 0;
+    goto out;
+
+out_close:
+    close(fd);
+    fd = -1;
+out:
+    if (fd >= 0) close(fd);
+    unlink(tmp_path);
+    remount_root_ro();
+    free(buf);
+    return rc;
+}
+
+static int disable_autostart(int *hook_remove_failed) {
+    int rc = 0;
+
+    if (hook_remove_failed) *hook_remove_failed = 0;
+    remount_userdata_rw();
+    if (unlink(DEFAULT_AUTOSTART_SCRIPT) < 0 && errno != ENOENT)
+        rc = -1;
+    if (remove_autostart_hook() < 0) {
+        rc = -1;
+        if (hook_remove_failed) *hook_remove_failed = 1;
+    }
+    return rc;
+}
+
+static void load_web_config(web_config_t *cfg) {
+    FILE *fp;
+    char line[5000];
+    int saw_platform = 0;
+
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->port = DEFAULT_WEBUI_PORT;
+    safe_copy(cfg->platform, sizeof(cfg->platform), "dingtalk");
+    safe_copy(cfg->custom_ctype, sizeof(cfg->custom_ctype),
+              "application/json;charset=utf-8");
+    safe_copy(cfg->custom_body, sizeof(cfg->custom_body),
+              "{\"text\":\"{{json_text}}\"}");
+    fp = fopen(DEFAULT_CONFIG_PATH, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp)) {
+        char *eq;
+        strip_line(line);
+        eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = 0;
+        if (strcmp(line, "webhook") == 0)
+            safe_copy(cfg->webhook, sizeof(cfg->webhook), eq);
+        else if (strcmp(line, "platform") == 0)
+        {
+            safe_copy(cfg->platform, sizeof(cfg->platform),
+                      normalize_platform(eq));
+            saw_platform = 1;
+        }
+        else if (strcmp(line, "custom_ctype") == 0)
+            safe_copy(cfg->custom_ctype, sizeof(cfg->custom_ctype), eq);
+        else if (strcmp(line, "custom_body") == 0)
+            config_unescape(cfg->custom_body, sizeof(cfg->custom_body), eq);
+        else if (strcmp(line, "num") == 0)
+            safe_copy(cfg->num, sizeof(cfg->num), eq);
+        else if (strcmp(line, "headtxt") == 0)
+            safe_copy(cfg->headtxt, sizeof(cfg->headtxt), eq);
+        else if (strcmp(line, "tailtxt") == 0)
+            safe_copy(cfg->tailtxt, sizeof(cfg->tailtxt), eq);
+        else if (strcmp(line, "port") == 0) {
+            long port;
+            char *end;
+            errno = 0;
+            port = strtol(eq, &end, 10);
+            if (!errno && end != eq && port > 0 && port <= 65535)
+                cfg->port = (int)port;
+        }
+    }
+    fclose(fp);
+    if (!saw_platform) {
+        safe_copy(cfg->platform, sizeof(cfg->platform),
+                  normalize_platform(detect_platform_from_url(cfg->webhook)));
+    }
+}
+
+static int save_web_config(const web_config_t *cfg) {
+    FILE *fp;
+    char esc_body[8192];
+
+    if (mkdir_parent_file(DEFAULT_CONFIG_PATH) < 0)
+        return -1;
+    config_escape(esc_body, sizeof(esc_body), cfg->custom_body);
+    fp = fopen(DEFAULT_CONFIG_PATH, "w");
+    if (!fp) return -1;
+    fprintf(fp, "webhook=%s\n", cfg->webhook);
+    fprintf(fp, "platform=%s\n", normalize_platform(cfg->platform));
+    fprintf(fp, "custom_ctype=%s\n", cfg->custom_ctype);
+    fprintf(fp, "custom_body=%s\n", esc_body);
+    fprintf(fp, "num=%s\n", cfg->num);
+    fprintf(fp, "headtxt=%s\n", cfg->headtxt);
+    fprintf(fp, "tailtxt=%s\n", cfg->tailtxt);
+    fprintf(fp, "port=%d\n", cfg->port > 0 ? cfg->port : DEFAULT_WEBUI_PORT);
+    if (fclose(fp) != 0)
+        return -1;
+    chmod(DEFAULT_CONFIG_PATH, 0600);
+    return 0;
+}
+
+static void buf_append(char *buf, size_t bufsz, const char *fmt, ...) {
+    size_t used;
+    va_list ap;
+
+    if (!bufsz) return;
+    used = strlen(buf);
+    if (used >= bufsz - 1) return;
+    va_start(ap, fmt);
+    vsnprintf(buf + used, bufsz - used, fmt, ap);
+    va_end(ap);
+}
+
+static void html_escape(char *out, size_t outsz, const char *in) {
+    size_t used = 0;
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        const char *rep = NULL;
+        char c = *in++;
+        if (c == '&') rep = "&amp;";
+        else if (c == '<') rep = "&lt;";
+        else if (c == '>') rep = "&gt;";
+        else if (c == '"') rep = "&quot;";
+        else if (c == '\'') rep = "&#39;";
+        if (rep) {
+            size_t n = strlen(rep);
+            if (used + n >= outsz) break;
+            memcpy(out + used, rep, n);
+            used += n;
+        } else {
+            out[used++] = c;
+        }
+    }
+    out[used] = 0;
+}
+
+static void json_escape(char *out, size_t outsz, const char *in) {
+    size_t used = 0;
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        unsigned char c = (unsigned char)*in++;
+        if (c == '"' || c == '\\') {
+            if (used + 2 >= outsz) break;
+            out[used++] = '\\';
+            out[used++] = (char)c;
+        } else if (c == '\n' || c == '\r') {
+            if (used + 2 >= outsz) break;
+            out[used++] = '\\';
+            out[used++] = 'n';
+        } else if (c < 0x20) {
+            continue;
+        } else {
+            out[used++] = (char)c;
+        }
+    }
+    out[used] = 0;
+}
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void url_decode(char *out, size_t outsz, const char *in, size_t inlen) {
+    size_t used = 0;
+    size_t i;
+
+    if (!outsz) return;
+    for (i = 0; i < inlen && used + 1 < outsz; i++) {
+        if (in[i] == '+') {
+            out[used++] = ' ';
+        } else if (in[i] == '%' && i + 2 < inlen) {
+            int a = hexval((unsigned char)in[i + 1]);
+            int b = hexval((unsigned char)in[i + 2]);
+            if (a >= 0 && b >= 0) {
+                out[used++] = (char)((a << 4) | b);
+                i += 2;
+            } else {
+                out[used++] = in[i];
+            }
+        } else {
+            out[used++] = in[i];
+        }
+    }
+    out[used] = 0;
+}
+
+static int form_value(const char *body, const char *key, char *out, size_t outsz) {
+    const char *p = body;
+    size_t keylen = strlen(key);
+
+    if (outsz) out[0] = 0;
+    while (p && *p) {
+        const char *amp = strchr(p, '&');
+        const char *eq = strchr(p, '=');
+        size_t pair_len = amp ? (size_t)(amp - p) : strlen(p);
+        if (eq && eq < p + pair_len &&
+            (size_t)(eq - p) == keylen && strncmp(p, key, keylen) == 0) {
+            url_decode(out, outsz, eq + 1, pair_len - keylen - 1);
+            return 1;
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+static int parse_port_text(const char *text, int *port) {
+    char *end;
+    long value;
+
+    if (!text || !*text)
+        return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno || end == text)
+        return -1;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+        end++;
+    if (*end || value <= 0 || value > 65535)
+        return -1;
+    *port = (int)value;
+    return 0;
+}
+
+static void request_webui_restart(int port) {
+    g_webui_restart_port = port;
+    g_webui_restart_requested = 1;
+}
+
+static void restart_webui_process(const char *self_path, int port) {
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        char port_arg[16];
+        const char *self = self_path && self_path[0] ? self_path : "/tmp/alice-pusher-bot";
+
+        snprintf(port_arg, sizeof(port_arg), "%d", port);
+        usleep(200000);
+        execl(self, self, "-w", "-L", port_arg, (char *)NULL);
+        _exit(127);
+    }
+}
+
+static pid_t read_pid_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    long pid = 0;
+
+    if (!fp) return 0;
+    fscanf(fp, "%ld", &pid);
+    fclose(fp);
+    if (pid <= 0 || pid > 999999)
+        return 0;
+    return (pid_t)pid;
+}
+
+static void write_pid_file(const char *path, pid_t pid) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return;
+    fprintf(fp, "%ld\n", (long)pid);
+    fclose(fp);
+}
+
+static int process_alive(pid_t pid) {
+    if (pid <= 0) return 0;
+    if (kill(pid, 0) == 0) return 1;
+    return errno == EPERM;
+}
+
+static pid_t service_pid(void) {
+    pid_t pid = read_pid_file(DEFAULT_SERVICE_PID);
+    int status = 0;
+
+    if (pid > 0 && waitpid(pid, &status, WNOHANG) == pid) {
+        unlink(DEFAULT_SERVICE_PID);
+        return 0;
+    }
+    if (!process_alive(pid)) {
+        unlink(DEFAULT_SERVICE_PID);
+        return 0;
+    }
+    return pid;
+}
+
+static void cleanup_strace_child(void) {
+    pid_t strace_pid = get_strace_pid_from_file();
+    if (strace_pid > 0 && process_alive(strace_pid)) {
+        kill(strace_pid, SIGTERM);
+        usleep(200 * 1000);
+        if (process_alive(strace_pid))
+            kill(strace_pid, SIGKILL);
+    }
+    {
+        int ztepid = find_zte_mifi_pid();
+        if (ztepid > 0)
+            kill(ztepid, SIGCONT);
+    }
+}
+
+static int stop_service(void) {
+    pid_t pid = read_pid_file(DEFAULT_SERVICE_PID);
+    int i;
+
+    if (!process_alive(pid)) {
+        unlink(DEFAULT_SERVICE_PID);
+        return 0;
+    }
+    kill(pid, SIGTERM);
+    for (i = 0; i < 30; i++) {
+        if (!process_alive(pid)) {
+            unlink(DEFAULT_SERVICE_PID);
+            return 0;
+        }
+        usleep(100 * 1000);
+    }
+    kill(pid, SIGKILL);
+    usleep(200 * 1000);
+    cleanup_strace_child();
+    unlink(DEFAULT_SERVICE_PID);
+    return 0;
+}
+
+static int start_service(const char *self_path, const web_config_t *cfg) {
+    pid_t pid;
+
+    if (!cfg->webhook[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (service_pid() > 0)
+        return 0;
+
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char url_arg[1200];
+        char num_arg[180];
+        char head_arg[320];
+        char tail_arg[320];
+        char platform_arg[80];
+        char custom_ctype_arg[180];
+        char custom_body_arg[2300];
+        char *args[16];
+        int n = 0;
+        int logfd;
+
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGHUP, SIG_IGN);
+        setsid();
+        logfd = open(DEFAULT_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (logfd >= 0) {
+            dup2(logfd, STDOUT_FILENO);
+            dup2(logfd, STDERR_FILENO);
+            if (logfd > STDERR_FILENO) close(logfd);
+        }
+
+        snprintf(url_arg, sizeof(url_arg), "--url=%s", cfg->webhook);
+        snprintf(platform_arg, sizeof(platform_arg), "--platform=%s",
+                 normalize_platform(cfg->platform));
+        snprintf(custom_ctype_arg, sizeof(custom_ctype_arg),
+                 "--custom-ctype=%s", cfg->custom_ctype);
+        snprintf(custom_body_arg, sizeof(custom_body_arg),
+                 "--custom-body=%s", cfg->custom_body);
+        snprintf(num_arg, sizeof(num_arg), "--num=%s", cfg->num);
+        snprintf(head_arg, sizeof(head_arg), "--headtxt=%s", cfg->headtxt);
+        snprintf(tail_arg, sizeof(tail_arg), "--tailtxt=%s", cfg->tailtxt);
+        args[n++] = (char *)self_path;
+        args[n++] = "--mode=service_start";
+        args[n++] = url_arg;
+        args[n++] = platform_arg;
+        if (strcmp(normalize_platform(cfg->platform), "custom") == 0) {
+            args[n++] = custom_ctype_arg;
+            args[n++] = custom_body_arg;
+        }
+        if (cfg->num[0]) args[n++] = num_arg;
+        if (cfg->headtxt[0]) args[n++] = head_arg;
+        if (cfg->tailtxt[0]) args[n++] = tail_arg;
+        args[n] = NULL;
+        execv(self_path, args);
+        _exit(127);
+    }
+    write_pid_file(DEFAULT_SERVICE_PID, pid);
+    return 0;
+}
+
+static void read_log_tail(char *out, size_t outsz) {
+	FILE *fp;
+	long size;
+	long start = 0;
+	size_t n;
+
+    if (outsz) out[0] = 0;
+    fp = fopen(DEFAULT_LOG_PATH, "r");
+    if (!fp) return;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        size = ftell(fp);
+        if (size > (long)LOG_TAIL_MAX)
+            start = size - (long)LOG_TAIL_MAX;
+        fseek(fp, start, SEEK_SET);
+    }
+	n = fread(out, 1, outsz > 0 ? outsz - 1 : 0, fp);
+	if (outsz) out[n] = 0;
+	fclose(fp);
+}
+
+static void resolve_self_path(char *out, size_t outsz, const char *argv0) {
+	ssize_t n;
+
+	if (!outsz) return;
+	out[0] = 0;
+	n = readlink("/proc/self/exe", out, outsz - 1);
+	if (n > 0) {
+		out[n] = 0;
+		return;
+	}
+	if (argv0 && argv0[0] == '/') {
+		safe_copy(out, outsz, argv0);
+		return;
+	}
+	if (argv0 && strchr(argv0, '/')) {
+		char cwd[512];
+		if (getcwd(cwd, sizeof(cwd))) {
+			snprintf(out, outsz, "%s/%s", cwd, argv0);
+			return;
+		}
+	}
+	safe_copy(out, outsz, argv0 ? argv0 : "alice-pusher-bot");
+}
+
+static int send_all_plain(int fd, const char *buf, size_t len) {
+	while (len) {
+		ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static void http_send(int fd, int code, const char *status,
+                      const char *ctype, const char *body) {
+    char header[256];
+    size_t body_len = strlen(body);
+    int len = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %lu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-store\r\n"
+        "\r\n",
+        code, status, ctype, (unsigned long)body_len);
+    if (len > 0)
+        send_all_plain(fd, header, (size_t)len);
+    send_all_plain(fd, body, body_len);
+}
+
+static void http_send_data(int fd, int code, const char *status,
+                           const char *ctype, const unsigned char *data,
+                           size_t data_len, const char *cache) {
+    char header[320];
+    int len = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %lu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: %s\r\n"
+        "\r\n",
+        code, status, ctype, (unsigned long)data_len,
+        cache ? cache : "no-store");
+    if (len > 0)
+        send_all_plain(fd, header, (size_t)len);
+    send_all_plain(fd, (const char *)data, data_len);
+}
+
+static void http_redirect(int fd, const char *location) {
+    char header[256];
+    int len = snprintf(header, sizeof(header),
+        "HTTP/1.1 303 See Other\r\n"
+        "Location: %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-store\r\n"
+        "\r\n",
+        location);
+    if (len > 0)
+        send_all_plain(fd, header, (size_t)len);
+}
+
+static void append_page_start(char *body, size_t bodysz, const char *active,
+                              const char *title, const char *subtitle,
+                              const char *message) {
+    char esc_msg[1024];
+    if (message && message[0])
+        html_escape(esc_msg, sizeof(esc_msg), message);
+    else
+        esc_msg[0] = 0;
+    buf_append(body, bodysz,
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>%s - Alice Pusher</title><style>"
+        "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f4f8f2;color:#18251d}a{color:inherit;text-decoration:none}"
+        "@keyframes rise{from{opacity:.62;transform:translateY(7px)}to{opacity:1;transform:none}}"
+        ".shell{min-height:100vh;display:grid;grid-template-columns:218px minmax(0,1fr)}.side{position:sticky;top:0;height:100vh;background:#fbfdf9;border-right:1px solid #dbe8dc;padding:18px 14px;display:flex;flex-direction:column;gap:16px}"
+        ".brand{font-size:19px;font-weight:800}.sub,.hint{font-size:12px;color:#67786b;margin-top:3px;line-height:1.45}.nav{display:flex;flex-direction:column;gap:6px}.nav a{border-radius:8px;padding:10px 11px;color:#405246;font-size:14px;font-weight:700}.nav a.active,.nav a:hover{background:#dcefe2;color:#1e5e3a}.sidecard{margin-top:auto;border:1px solid #dbe8dc;border-radius:8px;background:#fff;padding:12px}"
+        ".pill{display:inline-block;border-radius:999px;padding:6px 10px;background:#2f7d4f;color:#fff;font-size:13px;font-weight:800;white-space:nowrap}.pill.off{background:#7b8a80}"
+        "main.page{max-width:1120px;width:100%%;margin:0 auto;padding:22px}.topline{display:flex;justify-content:space-between;gap:14px;margin-bottom:16px}.h1{font-size:25px;font-weight:800}.msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}"
+        ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.panel{background:#fff;border:1px solid #d9e5dc;border-radius:8px;margin-bottom:14px;box-shadow:0 5px 16px rgba(24,37,29,.045);overflow:hidden;animation:rise .22s ease-out}.formtop{border-bottom:1px solid #e7eee8;padding:14px 16px}.title{font-size:16px;font-weight:800}.pad{padding:16px}.kv{border-bottom:1px solid #edf2ee;padding:8px 0}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:800;word-break:break-all;margin-top:3px}"
+        "label{display:block;font-size:13px;font-weight:800;margin:11px 0 5px}input,textarea,select{width:100%%;border:1px solid #b8c7bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none}input,select{height:40px}textarea{min-height:84px;resize:vertical}input:focus,textarea:focus,select:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.fieldrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}.fieldrow button{margin:0}.hint.ok{color:#236a40}.hint.warn{color:#9a5a10}"
+        ".custombox{display:none;margin-top:10px;padding:12px;border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;animation:rise .18s ease-out}.custombox.show{display:block}"
+        ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer}button.alt{background:#fff;color:#2f7d4f}pre{white-space:pre-wrap;word-break:break-word;background:#101811;color:#d9f5df;border-radius:8px;padding:12px;max-height:520px;overflow:auto}"
+        ".templates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.tpl{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:12px}.tplname{font-size:14px;font-weight:800}.tpltext{font-size:12px;color:#56695e;line-height:1.6;margin-top:5px;word-break:break-all}.tplcode{font-family:monospace;background:#eef6ef;border-radius:6px;padding:5px 6px;color:#234732}"
+        ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.labelrow{margin-top:13px;color:#5f7166;font-size:13px;font-weight:800}.labelrow .repo{margin-top:0}.supporthead{display:block}.supportdesc{color:#405246;font-size:14px;font-weight:700;line-height:1.75;margin-top:7px}.supportgrid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px;align-items:stretch}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.plainlink{display:inline-block;color:#1f6d42;font-weight:800;word-break:break-all}.qrbox{display:flex;justify-content:center;align-items:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
+        "@media(max-width:820px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc}.nav{flex-direction:row;overflow:auto}.sidecard{display:none}main.page{padding:16px}.grid,.about,.supportgrid,.templates{grid-template-columns:1fr}.topline{display:block}.qr{max-width:220px}}"
+        "</style></head><body><div class=\"shell\"><aside class=\"side\">"
+        "<div><div class=\"brand\">Alice Pusher</div><div class=\"sub\">短信推送控制台</div></div>"
+        "<nav class=\"nav\"><a class=\"%s\" href=\"/\">控制台</a><a class=\"%s\" href=\"/config\">配置</a><a class=\"%s\" href=\"/logs\">运行日志</a><a class=\"%s\" href=\"/about\">关于</a></nav>"
+        "<div class=\"sidecard\"><div class=\"hint\">WebUI</div><div class=\"pill\">%d</div></div></aside><main class=\"page\">"
+        "<div class=\"topline\"><div><div class=\"h1\">%s</div><div class=\"hint\">%s</div></div></div>",
+        title,
+        strcmp(active, "home") == 0 ? "active" : "",
+        strcmp(active, "config") == 0 ? "active" : "",
+        strcmp(active, "logs") == 0 ? "active" : "",
+        strcmp(active, "about") == 0 ? "active" : "",
+        g_webui_port, title, subtitle);
+    if (esc_msg[0])
+        buf_append(body, bodysz, "<div class=\"msg\">%s</div>", esc_msg);
+}
+
+static void append_page_end(char *body, size_t bodysz) {
+    buf_append(body, bodysz,
+        "</main></div><script>"
+        "function toggleCustom(){var s=document.getElementById('platformSelect'),b=document.getElementById('customFields');if(!s||!b)return;b.className=s.value==='custom'?'custombox show':'custombox';}"
+        "function fetchMsisdn(b){var i=document.getElementById('numInput'),m=document.getElementById('numMsg');"
+        "if(m){m.textContent='正在读取 nv show...';m.className='hint';}"
+        "if(b){b.disabled=true;b.textContent='获取中';}"
+        "fetch('/msisdn',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){"
+        "if(i&&j.num){i.value=j.num;i.focus();if(m){m.textContent='已读取手机号。';m.className='hint ok';}}"
+        "else{if(m){m.textContent='未从 nv show 读取到手机号，请手动填写或留空。';m.className='hint warn';}}"
+        "}).catch(function(){if(m){m.textContent='读取失败，请检查设备是否支持 nv show。';m.className='hint warn';}})"
+        ".finally(function(){if(b){b.disabled=false;b.textContent='获取';}});}"
+        "toggleCustom();"
+        "</script></body></html>");
+}
+
+static void render_home(int fd, const char *message) {
+    web_config_t cfg;
+    autostart_status_t ast;
+    char *body = calloc(1, WEB_BODY_MAX);
+    pid_t spid, strpid;
+    int ztepid;
+    char esc_num[256], esc_hook[256], esc_platform[128];
+    const char *auto_label;
+    const char *auto_detail;
+    const char *auto_payload;
+
+    if (!body) {
+        http_send(fd, 500, "Internal Server Error", "text/plain", "out of memory\n");
+        return;
+    }
+    load_web_config(&cfg);
+    get_autostart_status(&ast);
+    spid = service_pid();
+    strpid = get_strace_pid_from_file();
+    if (!process_alive(strpid)) strpid = 0;
+    ztepid = find_zte_mifi_pid();
+    html_escape(esc_num, sizeof(esc_num), cfg.num[0] ? cfg.num : "-");
+    html_escape(esc_hook, sizeof(esc_hook), cfg.webhook[0] ? "已配置" : "未配置");
+    html_escape(esc_platform, sizeof(esc_platform), platform_label(cfg.platform));
+    if (ast.run_ready && ast.bin_ready)
+        auto_payload = ".run 与二进制已就绪";
+    else if (ast.run_ready)
+        auto_payload = ".run 已就绪";
+    else if (ast.bin_ready)
+        auto_payload = "二进制已就绪";
+    else
+        auto_payload = "待安装";
+    if ((ast.run_ready || ast.bin_ready) && ast.script_ready && ast.hook_ready) {
+        auto_label = "已启用";
+        auto_detail = "开机会启动 Alice Pusher WebUI";
+    } else if (ast.script_ready || ast.hook_ready) {
+        auto_label = "部分启用";
+        auto_detail = "启动脚本或系统钩子不完整，可重新启用修复";
+    } else {
+        auto_label = "未启用";
+        auto_detail = "点击启用时会自动复制当前启动文件";
+    }
+
+    append_page_start(body, WEB_BODY_MAX, "home", "控制台",
+                      "管理短信推送服务、strace 状态和测试推送", message);
+    buf_append(body, WEB_BODY_MAX,
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">运行状态</div></div><div class=\"pad\"><div class=\"grid\">"
+        "<div class=\"kv\"><div class=\"k\">服务状态</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">服务 PID</div><div class=\"v\">%ld</div></div>"
+        "<div class=\"kv\"><div class=\"k\">strace PID</div><div class=\"v\">%ld</div></div>"
+        "<div class=\"kv\"><div class=\"k\">zte_mifi PID</div><div class=\"v\">%d</div></div>"
+        "<div class=\"kv\"><div class=\"k\">推送平台</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">Webhook</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">设备手机号</div><div class=\"v\">%s</div></div>"
+        "</div><div class=\"actions\">"
+        "<form method=\"post\" action=\"/start\"><button type=\"submit\">启动服务</button></form>"
+        "<form method=\"post\" action=\"/stop\"><button class=\"alt\" type=\"submit\">停止服务</button></form>"
+        "<form method=\"post\" action=\"/restart\"><button class=\"alt\" type=\"submit\">重启服务</button></form>"
+        "</div></div></section>"
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">测试推送</div></div><div class=\"pad\"><form method=\"post\" action=\"/test\">"
+        "<label>测试消息</label><textarea name=\"txt\">Alice Pusher Bot 测试消息</textarea>"
+        "<div class=\"actions\"><button type=\"submit\">发送测试消息</button></div></form></div></section>"
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">开机自启动</div></div><div class=\"pad\"><div class=\"grid\">"
+        "<div class=\"kv\"><div class=\"k\">状态</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">说明</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">启动文件</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">启动脚本</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">系统钩子</div><div class=\"v\">%s</div></div>"
+        "</div><div class=\"actions\">"
+        "<form method=\"post\" action=\"/autostart_on\"><button type=\"submit\">启用自启动</button></form>"
+        "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\">关闭自启动</button></form>"
+        "</div><div class=\"hint\">持久路径：" DEFAULT_RUN_PATH " / " DEFAULT_BIN_PATH "</div></div></section>",
+        spid > 0 ? "运行中" : "未运行", (long)spid, (long)strpid,
+        ztepid > 0 ? ztepid : 0, esc_platform, esc_hook, esc_num,
+        auto_label, auto_detail, auto_payload,
+        ast.script_ready ? "已写入" : "未写入",
+        ast.hook_ready ? "已安装" : "未安装");
+    append_page_end(body, WEB_BODY_MAX);
+    http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
+    free(body);
+}
+
+static void render_config(int fd, const char *message) {
+    web_config_t cfg;
+    char *body = calloc(1, WEB_BODY_MAX);
+    char *custom_body = calloc(1, 12288);
+    char webhook[2048], num[256], head[512], tail[512];
+    char custom_ctype[256];
+    int port;
+
+    if (!body || !custom_body) {
+        free(body);
+        free(custom_body);
+        http_send(fd, 500, "Internal Server Error", "text/plain", "out of memory\n");
+        return;
+    }
+    load_web_config(&cfg);
+    html_escape(webhook, sizeof(webhook), cfg.webhook);
+    html_escape(num, sizeof(num), cfg.num);
+    html_escape(head, sizeof(head), cfg.headtxt);
+    html_escape(tail, sizeof(tail), cfg.tailtxt);
+    html_escape(custom_ctype, sizeof(custom_ctype), cfg.custom_ctype);
+    html_escape(custom_body, 12288, cfg.custom_body);
+    port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
+    append_page_start(body, WEB_BODY_MAX, "config", "配置",
+                      "保存 webhook、手机号和推送文本前后缀", message);
+    buf_append(body, WEB_BODY_MAX,
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">WebUI 设置</div></div><div class=\"pad\">"
+        "<form method=\"post\" action=\"/set_port\">"
+        "<label>WebUI 端口</label><input name=\"port\" value=\"%d\" inputmode=\"numeric\" pattern=\"[0-9]*\" required>"
+        "<div class=\"actions\"><button type=\"submit\">保存并切换端口</button></div>"
+        "</form><div class=\"hint\">端口默认保存到 " DEFAULT_CONFIG_PATH "。修改后 WebUI 会立即切换到新端口；ADB 访问需要重新映射新端口。</div>"
+        "</div></section>"
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">推送配置</div></div><div class=\"pad\">"
+        "<form method=\"post\" action=\"/save_config\">"
+        "<label>推送平台</label><select id=\"platformSelect\" name=\"platform\" onchange=\"toggleCustom()\">"
+        "<option value=\"dingtalk\"%s>钉钉</option>"
+        "<option value=\"feishu\"%s>飞书</option>"
+        "<option value=\"wecom\"%s>企业微信</option>"
+        "<option value=\"serverchan\"%s>Server 酱</option>"
+        "<option value=\"discord\"%s>Discord</option>"
+        "<option value=\"telegram\"%s>Telegram Bot</option>"
+        "<option value=\"bark\"%s>Bark</option>"
+        "<option value=\"custom\"%s>自定义</option>"
+        "</select>"
+        "<label>Webhook URL</label><textarea name=\"webhook\" required>%s</textarea>"
+        "<div id=\"customFields\" class=\"custombox\">"
+        "<label>自定义 Content-Type</label><input name=\"custom_ctype\" value=\"%s\">"
+        "<label>自定义消息体模板</label><textarea name=\"custom_body\" rows=\"8\">%s</textarea>"
+        "<div class=\"hint\">占位符：{{json_text}} 适合 JSON 字符串，{{url_text}} 适合表单或 URL 编码，{{text}} 为原文。</div>"
+        "</div>"
+        "<label>设备手机号，可留空自动读取 nv show</label><div class=\"fieldrow\"><input id=\"numInput\" name=\"num\" value=\"%s\"><button class=\"alt\" type=\"button\" onclick=\"fetchMsisdn(this)\">获取</button></div><div id=\"numMsg\" class=\"hint\">获取不到时可手动填写，也可以留空。</div>"
+        "<label>消息前缀</label><input name=\"headtxt\" value=\"%s\">"
+        "<label>消息后缀</label><input name=\"tailtxt\" value=\"%s\">"
+        "<div class=\"actions\"><button type=\"submit\">保存配置</button></div>"
+        "</form><div class=\"hint\">配置保存到 " DEFAULT_CONFIG_PATH "，权限 0600。</div></div></section>"
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">Webhook 模板</div></div><div class=\"pad templates\">"
+        "<div class=\"tpl\"><div class=\"tplname\">钉钉</div><div class=\"tpltext\">机器人地址一般形如 <span class=\"tplcode\">https://oapi.dingtalk.com/robot/send?access_token=...</span>。消息体使用 text 类型：<span class=\"tplcode\">msgtype/text/content</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">飞书</div><div class=\"tpltext\">自定义机器人地址一般形如 <span class=\"tplcode\">https://open.feishu.cn/open-apis/bot/v2/hook/...</span>。消息体使用 text 类型：<span class=\"tplcode\">msg_type/content/text</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">企业微信</div><div class=\"tpltext\">群机器人地址一般形如 <span class=\"tplcode\">https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...</span>。消息体使用 text 类型：<span class=\"tplcode\">msgtype/text/content</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">Server 酱</div><div class=\"tpltext\">SendKey 地址一般形如 <span class=\"tplcode\">https://sctapi.ftqq.com/SENDKEY.send</span>。消息体使用表单字段：<span class=\"tplcode\">title/desp</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">Discord</div><div class=\"tpltext\">Webhook 地址形如 <span class=\"tplcode\">https://discord.com/api/webhooks/...</span>。消息体使用 JSON 字段：<span class=\"tplcode\">content</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">Telegram Bot</div><div class=\"tpltext\">URL 写成 <span class=\"tplcode\">https://api.telegram.org/botTOKEN/sendMessage?chat_id=CHAT_ID</span>。消息体使用表单字段：<span class=\"tplcode\">text</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">Bark</div><div class=\"tpltext\">URL 写成 <span class=\"tplcode\">https://api.day.app/your_key</span>。程序会提取 key 并向 <span class=\"tplcode\">/push</span> 发送 JSON：<span class=\"tplcode\">device_key/title/body</span>。</div></div>"
+        "<div class=\"tpl\"><div class=\"tplname\">自定义</div><div class=\"tpltext\">自行填写 Content-Type 与消息体模板。JSON 示例：<span class=\"tplcode\">{&quot;text&quot;:&quot;{{json_text}}&quot;}</span>；表单示例：<span class=\"tplcode\">title=Alice&amp;desp={{url_text}}</span>。</div></div>"
+        "</div></section>",
+        port,
+        selected_attr(cfg.platform, "dingtalk"),
+        selected_attr(cfg.platform, "feishu"),
+        selected_attr(cfg.platform, "wecom"),
+        selected_attr(cfg.platform, "serverchan"),
+        selected_attr(cfg.platform, "discord"),
+        selected_attr(cfg.platform, "telegram"),
+        selected_attr(cfg.platform, "bark"),
+        selected_attr(cfg.platform, "custom"),
+        webhook, custom_ctype, custom_body, num, head, tail);
+    append_page_end(body, WEB_BODY_MAX);
+    http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
+    free(custom_body);
+    free(body);
+}
+
+static void render_logs(int fd, const char *message) {
+    char *body = calloc(1, WEB_BODY_MAX);
+    char *logbuf = calloc(1, LOG_TAIL_MAX + 1);
+    char *esc = calloc(1, LOG_TAIL_MAX * 6 + 1);
+
+    if (!body || !logbuf || !esc) {
+        free(body); free(logbuf); free(esc);
+        http_send(fd, 500, "Internal Server Error", "text/plain", "out of memory\n");
+        return;
+    }
+    read_log_tail(logbuf, LOG_TAIL_MAX + 1);
+    html_escape(esc, LOG_TAIL_MAX * 6 + 1, logbuf[0] ? logbuf : "暂无日志");
+    append_page_start(body, WEB_BODY_MAX, "logs", "运行日志",
+                      "显示 /tmp/alice_pusher.log 最近内容", message);
+    buf_append(body, WEB_BODY_MAX,
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">日志</div></div><div class=\"pad\"><pre>%s</pre>"
+        "<div class=\"actions\"><form method=\"get\" action=\"/logs\"><button class=\"alt\" type=\"submit\">刷新</button></form></div></div></section>",
+        esc);
+    append_page_end(body, WEB_BODY_MAX);
+    http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
+    free(body); free(logbuf); free(esc);
+}
+
+static void render_about(int fd) {
+    char *body = calloc(1, WEB_BODY_MAX);
+    if (!body) {
+        http_send(fd, 500, "Internal Server Error", "text/plain", "out of memory\n");
+        return;
+    }
+    append_page_start(body, WEB_BODY_MAX, "about", "关于",
+                      "项目信息与署名", NULL);
+    buf_append(body, WEB_BODY_MAX,
+        "<section class=\"panel\"><div class=\"pad about\">"
+        "<img class=\"avatar\" src=\"/avatar.jpg\" alt=\"avatar\">"
+        "<div><div class=\"aboutname\">alice-pusher-bot-zxic</div>"
+        "<div class=\"hint\">ZTE MiFi 短信捕获与 Webhook 推送工具</div>"
+        "<div class=\"labelrow\">项目地址：<a class=\"repo\" href=\"https://github.com/Amamiyashi0n/alice-pusher-bot-zxic\">"
+        "github.com/Amamiyashi0n/alice-pusher-bot-zxic</a></div>"
+        "<div class=\"signature\">世间自有尘寰在，我亦独吟游且歌。</div>"
+        "</div></div></section>"
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"supporthead\">"
+        "<div class=\"title\">赞助支持</div>"
+        "<div class=\"supportdesc\">软件免费，代码开源。<br>"
+        "如果可以的话，也许您可以给予我一些小小的帮助。</div></div></div>"
+        "<div class=\"pad supportgrid\">"
+        "<div class=\"supportcard\"><div class=\"supporttitle\">微信 / 支付宝扫码</div>"
+        "<div class=\"qrbox\"><img class=\"qr\" src=\"/sponsor.jpg\" alt=\"sponsor qrcode\"></div>"
+        "</div><div class=\"supportcard\"><div class=\"supporttitle\">爱发电</div>"
+        "<a class=\"plainlink\" href=\"https://ifdian.net/a/amamiyashion\">"
+        "ifdian.net/a/amamiyashion</a>"
+        "</div></div></section>");
+    append_page_end(body, WEB_BODY_MAX);
+    http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
+    free(body);
+}
+
+static void render_avatar(int fd) {
+    http_send_data(fd, 200, "OK", avatar_image_mime,
+                   avatar_image_data, avatar_image_size,
+                   "public, max-age=86400");
+}
+
+static void render_sponsor_image(int fd) {
+    http_send_data(fd, 200, "OK", sponsor_image_mime,
+                   sponsor_image_data, sponsor_image_size,
+                   "public, max-age=86400");
+}
+
+static void render_status_json(int fd) {
+    web_config_t cfg;
+    char num[256];
+    char platform[96];
+    pid_t spid = service_pid();
+    pid_t strpid = get_strace_pid_from_file();
+    int ztepid = find_zte_mifi_pid();
+    char body[1024];
+
+    load_web_config(&cfg);
+    if (!process_alive(strpid)) strpid = 0;
+    json_escape(num, sizeof(num), cfg.num);
+    json_escape(platform, sizeof(platform), platform_label(cfg.platform));
+    snprintf(body, sizeof(body),
+        "{\"service_running\":%s,\"service_pid\":%ld,"
+        "\"strace_pid\":%ld,\"zte_mifi_pid\":%d,"
+        "\"webhook_configured\":%s,\"platform\":\"%s\","
+        "\"num\":\"%s\",\"port\":%d}\n",
+        spid > 0 ? "true" : "false", (long)spid, (long)strpid,
+        ztepid > 0 ? ztepid : 0, cfg.webhook[0] ? "true" : "false",
+        platform, num, g_webui_port);
+    http_send(fd, 200, "OK", "application/json; charset=utf-8", body);
+}
+
+static void render_msisdn_json(int fd) {
+    char num[256];
+    char body[640];
+
+    load_device_msisdn_from_nv_show();
+    json_escape(num, sizeof(num), device_msisdn);
+    snprintf(body, sizeof(body),
+             "{\"ok\":%s,\"num\":\"%s\",\"message\":\"%s\"}\n",
+             device_msisdn[0] ? "true" : "false", num,
+             device_msisdn[0] ? "已读取手机号" :
+             "未从 nv show 读取到手机号");
+    http_send(fd, 200, "OK", "application/json; charset=utf-8", body);
+}
+
+static void handle_save_config(int fd, const char *body) {
+    web_config_t cfg;
+    int saved_port;
+
+    load_web_config(&cfg);
+    saved_port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
+    form_value(body, "webhook", cfg.webhook, sizeof(cfg.webhook));
+    form_value(body, "platform", cfg.platform, sizeof(cfg.platform));
+    form_value(body, "custom_ctype", cfg.custom_ctype,
+               sizeof(cfg.custom_ctype));
+    form_value(body, "custom_body", cfg.custom_body,
+               sizeof(cfg.custom_body));
+    form_value(body, "num", cfg.num, sizeof(cfg.num));
+    form_value(body, "headtxt", cfg.headtxt, sizeof(cfg.headtxt));
+    form_value(body, "tailtxt", cfg.tailtxt, sizeof(cfg.tailtxt));
+    cfg.port = saved_port;
+    remove_newlines(cfg.webhook);
+    safe_copy(cfg.platform, sizeof(cfg.platform),
+              normalize_platform(cfg.platform));
+    remove_newlines(cfg.custom_ctype);
+    if (!cfg.custom_ctype[0])
+        safe_copy(cfg.custom_ctype, sizeof(cfg.custom_ctype),
+                  "application/json;charset=utf-8");
+    remove_newlines(cfg.num);
+    remove_newlines(cfg.headtxt);
+    remove_newlines(cfg.tailtxt);
+    if (!cfg.webhook[0]) {
+        render_config(fd, "Webhook 不能为空。");
+        return;
+    }
+    if (strcmp(normalize_platform(cfg.platform), "custom") == 0 &&
+        !cfg.custom_body[0]) {
+        render_config(fd, "自定义消息体模板不能为空。");
+        return;
+    }
+    if (save_web_config(&cfg) < 0) {
+        render_config(fd, "配置保存失败，请检查 /mnt/userdata 是否可写。");
+        return;
+    }
+    render_config(fd, "配置已保存。");
+}
+
+static void handle_set_port(int fd, const char *body) {
+    web_config_t cfg;
+    char value[32];
+    char response[1024];
+    int port;
+
+    load_web_config(&cfg);
+    form_value(body, "port", value, sizeof(value));
+    if (parse_port_text(value, &port) < 0) {
+        render_config(fd, "端口无效，请输入 1-65535。");
+        return;
+    }
+    cfg.port = port;
+    if (save_web_config(&cfg) < 0) {
+        render_config(fd, "端口保存失败，请检查 /mnt/userdata 是否可写。");
+        return;
+    }
+    if (port == g_webui_port) {
+        render_config(fd, "WebUI 端口已保存。");
+        return;
+    }
+
+    snprintf(response, sizeof(response),
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>WebUI 端口已切换</title>"
+        "<style>body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f4f8f2;color:#18251d}"
+        ".box{max-width:560px;margin:12vh auto;padding:22px;background:#fff;border:1px solid #d9e5dc;border-radius:8px;box-shadow:0 8px 24px rgba(24,37,29,.06)}"
+        ".h{font-size:22px;font-weight:800}.p{color:#55685c;line-height:1.7}.a{display:inline-block;margin-top:10px;color:#1f6d42;font-weight:800}</style>"
+        "</head><body><div class=\"box\"><div class=\"h\">WebUI 端口已保存</div>"
+        "<div class=\"p\">服务正在切换到 %d 端口。ADB 访问时请重新映射新端口，然后打开新地址。</div>"
+        "<a class=\"a\" href=\"http://127.0.0.1:%d/\">http://127.0.0.1:%d/</a>"
+        "</div></body></html>",
+        port, port, port);
+    http_send(fd, 200, "OK", "text/html; charset=utf-8", response);
+    request_webui_restart(port);
+}
+
+static void handle_autostart_on(int fd) {
+    if (write_autostart_script() < 0) {
+        render_home(fd, "自启动脚本写入失败，请检查 /mnt/userdata 是否可写。");
+        return;
+    }
+    if (install_autostart_hook() < 0) {
+        render_home(fd, "自启动脚本已写入，但 /etc/rc 钩子安装失败。");
+        return;
+    }
+    render_home(fd, "开机自启动已启用。");
+}
+
+static void handle_autostart_off(int fd) {
+    int hook_failed = 0;
+
+    if (disable_autostart(&hook_failed) < 0) {
+        render_home(fd, hook_failed ?
+                    "自启动脚本已尝试删除，但 /etc/rc 钩子移除失败。" :
+                    "关闭自启动失败，请检查持久分区状态。");
+        return;
+    }
+    render_home(fd, "开机自启动已关闭。");
+}
+
+static void handle_start(int fd, const char *self_path) {
+    web_config_t cfg;
+    load_web_config(&cfg);
+    if (start_service(self_path, &cfg) < 0) {
+        render_home(fd, "启动失败：请先保存有效 Webhook，或查看日志。");
+        return;
+    }
+    render_home(fd, "服务已启动。");
+}
+
+static void handle_stop(int fd) {
+    stop_service();
+    render_home(fd, "服务已停止。");
+}
+
+static void handle_restart(int fd, const char *self_path) {
+    web_config_t cfg;
+    load_web_config(&cfg);
+    stop_service();
+    if (start_service(self_path, &cfg) < 0) {
+        render_home(fd, "重启失败：请先保存有效 Webhook，或查看日志。");
+        return;
+    }
+    render_home(fd, "服务已重启。");
+}
+
+static int run_test_message(const char *self_path, const web_config_t *cfg,
+                            const char *txt) {
+    pid_t pid;
+    int status = 0;
+
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char url_arg[1200];
+        char txt_arg[1400];
+        char platform_arg[80];
+        char custom_ctype_arg[180];
+        char custom_body_arg[2300];
+        char *args[10];
+        int n = 0;
+        int logfd;
+
+        logfd = open(DEFAULT_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (logfd >= 0) {
+            dup2(logfd, STDOUT_FILENO);
+            dup2(logfd, STDERR_FILENO);
+            if (logfd > STDERR_FILENO) close(logfd);
+        }
+        snprintf(url_arg, sizeof(url_arg), "--url=%s", cfg->webhook);
+        snprintf(platform_arg, sizeof(platform_arg), "--platform=%s",
+                 normalize_platform(cfg->platform));
+        snprintf(custom_ctype_arg, sizeof(custom_ctype_arg),
+                 "--custom-ctype=%s", cfg->custom_ctype);
+        snprintf(custom_body_arg, sizeof(custom_body_arg),
+                 "--custom-body=%s", cfg->custom_body);
+        snprintf(txt_arg, sizeof(txt_arg), "--txt=%s", txt);
+        args[n++] = (char *)self_path;
+        args[n++] = "--mode=send_once";
+        args[n++] = url_arg;
+        args[n++] = platform_arg;
+        if (strcmp(normalize_platform(cfg->platform), "custom") == 0) {
+            args[n++] = custom_ctype_arg;
+            args[n++] = custom_body_arg;
+        }
+        args[n++] = "--msgtype=text";
+        args[n++] = txt_arg;
+        args[n] = NULL;
+        execv(self_path, args);
+        _exit(127);
+    }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    return -1;
+}
+
+static void handle_test(int fd, const char *self_path, const char *body) {
+    web_config_t cfg;
+    char txt[1024];
+
+    load_web_config(&cfg);
+    if (!cfg.webhook[0]) {
+        render_home(fd, "请先保存 Webhook。");
+        return;
+    }
+    if (!form_value(body, "txt", txt, sizeof(txt)) || !txt[0])
+        safe_copy(txt, sizeof(txt), "Alice Pusher Bot 测试消息");
+    remove_newlines(txt);
+    if (run_test_message(self_path, &cfg, txt) == 0)
+        render_home(fd, "测试消息已发送，请检查 Webhook 返回和运行日志。");
+    else
+        render_home(fd, "测试消息发送失败，请检查 Webhook 和运行日志。");
+}
+
+static int read_http_request(int fd, char *req, size_t reqsz, char **body_out) {
+    size_t used = 0;
+    int content_len = 0;
+    char *hdr_end = NULL;
+
+    if (body_out) *body_out = NULL;
+    while (used + 1 < reqsz) {
+        ssize_t n = recv(fd, req + used, reqsz - used - 1, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;
+        used += (size_t)n;
+        req[used] = 0;
+        hdr_end = strstr(req, "\r\n\r\n");
+        if (hdr_end) {
+            char *cl = strstr(req, "Content-Length:");
+            if (!cl) cl = strstr(req, "content-length:");
+            if (cl) content_len = atoi(cl + 15);
+            if ((size_t)(hdr_end + 4 - req) + (size_t)content_len <= used)
+                break;
+        }
+    }
+    if (!hdr_end)
+        hdr_end = strstr(req, "\r\n\r\n");
+    if (!hdr_end)
+        return -1;
+    if (body_out)
+        *body_out = hdr_end + 4;
+    return 0;
+}
+
+static void handle_http_client(int fd, const char *self_path) {
+    char req[WEB_REQ_MAX];
+    char method[8];
+    char path[256];
+    char *body;
+
+    memset(req, 0, sizeof(req));
+    if (read_http_request(fd, req, sizeof(req), &body) < 0) {
+        http_send(fd, 400, "Bad Request", "text/plain", "bad request\n");
+        return;
+    }
+    if (sscanf(req, "%7s %255s", method, path) != 2) {
+        http_send(fd, 400, "Bad Request", "text/plain", "bad request\n");
+        return;
+    }
+    if (strcmp(method, "GET") == 0) {
+        if (strcmp(path, "/") == 0) render_home(fd, NULL);
+        else if (strcmp(path, "/config") == 0) render_config(fd, NULL);
+        else if (strcmp(path, "/logs") == 0) render_logs(fd, NULL);
+        else if (strcmp(path, "/about") == 0) render_about(fd);
+        else if (strcmp(path, "/avatar.jpg") == 0) render_avatar(fd);
+        else if (strcmp(path, "/sponsor.jpg") == 0) render_sponsor_image(fd);
+        else if (strcmp(path, "/status") == 0) render_status_json(fd);
+        else if (strcmp(path, "/msisdn") == 0) render_msisdn_json(fd);
+        else http_send(fd, 404, "Not Found", "text/plain", "not found\n");
+        return;
+    }
+    if (strcmp(method, "POST") == 0) {
+        if (strcmp(path, "/save_config") == 0) handle_save_config(fd, body);
+        else if (strcmp(path, "/set_port") == 0) handle_set_port(fd, body);
+        else if (strcmp(path, "/autostart_on") == 0) handle_autostart_on(fd);
+        else if (strcmp(path, "/autostart_off") == 0) handle_autostart_off(fd);
+        else if (strcmp(path, "/start") == 0) handle_start(fd, self_path);
+        else if (strcmp(path, "/stop") == 0) handle_stop(fd);
+        else if (strcmp(path, "/restart") == 0) handle_restart(fd, self_path);
+        else if (strcmp(path, "/test") == 0) handle_test(fd, self_path, body);
+        else http_send(fd, 404, "Not Found", "text/plain", "not found\n");
+        return;
+    }
+    http_send(fd, 405, "Method Not Allowed", "text/plain", "method not allowed\n");
+}
+
+static int run_webui(const char *self_path, int port) {
+    int sfd;
+    int yes = 1;
+    struct sockaddr_in addr;
+
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    if (port <= 0 || port > 65535)
+        port = DEFAULT_WEBUI_PORT;
+    g_webui_port = port;
+
+    sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) {
+        perror("socket");
+        return 1;
+    }
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(sfd);
+        return 1;
+    }
+    if (listen(sfd, 8) < 0) {
+        perror("listen");
+        close(sfd);
+        return 1;
+    }
+    printf("Alice Pusher WebUI listening on 0.0.0.0:%d\n", port);
+    fflush(stdout);
+    for (;;) {
+        int cfd = accept(sfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            continue;
+        }
+        handle_http_client(cfd, self_path);
+        close(cfd);
+        if (g_webui_restart_requested)
+            break;
+    }
+    close(sfd);
+    if (g_webui_restart_requested) {
+        restart_webui_process(self_path, g_webui_restart_port);
+        _exit(0);
+    }
+    return 0;
+}
 
 int main(int argc, char *argv[]) {
     int only_service_mode = 0;
+    int only_strace_mode = 0;
+    int only_rerun_mode = 0;
     int only_send_once_mode = 0;
+    int webui_mode = 0;
+    int webui_port = DEFAULT_WEBUI_PORT;
+    web_config_t saved_cfg;
     char *headtxt = NULL, *tailtxt = NULL;
-    char *keyword = NULL;
-    char *number = NULL; // 添加number变量
-    char *activekey = NULL; // 添加activekey变量
+    char *manual_msisdn = NULL;
+    char *cli_platform = NULL;
+    char *cli_custom_ctype = NULL;
+    char *cli_custom_body = NULL;
+    char *cli_url = NULL;
+    char *cli_msgtype = NULL;
+    char *cli_txt = NULL;
     int i;
-    
-    // 解析命令行参数
+
+    load_web_config(&saved_cfg);
+    if (saved_cfg.port > 0 && saved_cfg.port <= 65535)
+        webui_port = saved_cfg.port;
+
     for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--webui") == 0) {
+            webui_mode = 1;
+        }
+        if (strcmp(argv[i], "-L") == 0 && i + 1 < argc) {
+            webui_port = atoi(argv[++i]);
+        }
+        if (strncmp(argv[i], "--port=", 7) == 0) {
+            webui_port = atoi(argv[i] + 7);
+        }
+        if ((strcmp(argv[i], "--mode=strace_zte_mifi") == 0)) {
+            only_strace_mode = 1;
+        }
+        if ((strcmp(argv[i], "--mode=re-run-strace_zte_mifi") == 0)) {
+            only_rerun_mode = 1;
+        }
         if ((strcmp(argv[i], "--mode=service_start") == 0)) {
             only_service_mode = 1;
         }
-        if ((strcmp(argv[i], "--mode=send_once") == 0)) {
+        if ((strcmp(argv[i], "--mode=send_once") == 0)) { // 新增
             only_send_once_mode = 1;
         }
         if (strncmp(argv[i], "--headtxt=", 10) == 0) {
@@ -2398,67 +2964,74 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
             tailtxt = argv[i] + 10;
         }
-        // 添加对--keyword参数的解析
-        if (strncmp(argv[i], "--keyword=", 10) == 0) {
-            keyword = argv[i] + 10;
+        if (strncmp(argv[i], "--num=", 6) == 0) {
+            manual_msisdn = argv[i] + 6;
         }
-        // 添加对--number参数的解析
-        if (strncmp(argv[i], "--number=", 9) == 0) {
-            number = argv[i] + 9;
+        if (strncmp(argv[i], "--platform=", 11) == 0) {
+            cli_platform = argv[i] + 11;
         }
-        // 添加对--activekey参数的解析
-        if (strncmp(argv[i], "--activekey=", 12) == 0) {
-            activekey = argv[i] + 12;
+        if (strncmp(argv[i], "--custom-ctype=", 15) == 0) {
+            cli_custom_ctype = argv[i] + 15;
         }
-        // 添加对--targetbin参数的解析
-        if (strncmp(argv[i], "--targetbin=", 12) == 0) {
-            const char *mifi_path = argv[i] + 12;
-            if (strlen(mifi_path) < sizeof(zte_mifi_path) - 1) {
-                strncpy(zte_mifi_path, mifi_path, sizeof(zte_mifi_path) - 1);
-                zte_mifi_path[sizeof(zte_mifi_path) - 1] = '\0';
-            }
+        if (strncmp(argv[i], "--custom-body=", 14) == 0) {
+            cli_custom_body = argv[i] + 14;
         }
-        // 添加对--tracebin参数的解析
-        if (strncmp(argv[i], "--tracebin=", 11) == 0) {
-            const char *path = argv[i] + 11;
-            if (strlen(path) < sizeof(strace_bin_path) - 1) {
-                strncpy(strace_bin_path, path, sizeof(strace_bin_path) - 1);
-                strace_bin_path[sizeof(strace_bin_path) - 1] = '\0';
-            }
+        if (strncmp(argv[i], "--url=", 6) == 0) {
+            cli_url = argv[i] + 6;
+        }
+        if (strncmp(argv[i], "--msgtype=", 10) == 0) {
+            cli_msgtype = argv[i] + 10;
+        }
+        if (strncmp(argv[i], "--txt=", 6) == 0) {
+            cli_txt = argv[i] + 6;
         }
     }
-    
-    // 如果提供了activekey参数，显示激活信息
-    if (activekey) {
-        printf("当前设备已经激活 激活码为%s\n", activekey);
+    if (webui_mode) {
+        char self_path[512];
+        resolve_self_path(self_path, sizeof(self_path), argv[0]);
+        return run_webui(self_path, webui_port);
     }
-    
+    if (only_strace_mode && argc == 2) {
+        trace_zte_mifi();
+        return 0;
+    }
+    if (only_rerun_mode && argc == 2) {
+        rerun_strace_zte_mifi();
+        return 0;
+    }
     if (only_service_mode) {
         service_start_time = time(NULL);
-        char *webhook = NULL;
-        for (i = 1; i < argc; i++) {
-            if (strncmp(argv[i], "--url=", 6) == 0) {
-                webhook = argv[i] + 6;
-            }
-        }
-        if (!webhook || strlen(webhook) == 0) {
+        const char *platform;
+        if (!cli_url || strlen(cli_url) == 0) {
             fprintf(stderr, "Error: --mode=service_start 时必须指定 --url=<webhook_url> 参数！\n");
             return 1;
         }
-        
-        // 初始化SIM卡号（仅在未指定number参数时）
-        if (!number) {
-            init_sim_number();
+        platform = normalize_platform(cli_platform && cli_platform[0] ?
+                                      cli_platform :
+                                      detect_platform_from_url(cli_url));
+        if (manual_msisdn && manual_msisdn[0]) {
+            strncpy(device_msisdn, manual_msisdn, sizeof(device_msisdn) - 1);
+            device_msisdn[sizeof(device_msisdn) - 1] = 0;
+        } else {
+            load_device_msisdn_from_nv_show();
+            if (!device_msisdn[0]) {
+                strncpy(device_msisdn, "读取手机号失败 请使用 --num=参数进行手动添加", sizeof(device_msisdn) - 1);
+                device_msisdn[sizeof(device_msisdn) - 1] = 0;
+            }
         }
-        
+        printf("Alice Pushbot - Service mode starting.\n");
+        printf("Target: /sbin/zte_mifi (strace attached).\n");
+        printf("Press Ctrl+C to stop.\n");
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
-        if (pthread_create(&strace_thread_id, NULL, strace_thread_func, webhook) != 0) {
+        if (pthread_create(&strace_thread_id, NULL, strace_thread_func, cli_url) != 0) {
             perror("Failed to create strace thread");
             return 1;
         }
-        // 修改传递给PDU线程的参数，包含keyword
-        char* pdu_args[5] = {webhook, headtxt, tailtxt, keyword, number};
+        char* pdu_args[6] = {
+            cli_url, (char *)platform, cli_custom_ctype, cli_custom_body,
+            headtxt, tailtxt
+        };
         if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func, pdu_args) != 0) {
             perror("Failed to create PDU thread");
             return 1;
@@ -2467,231 +3040,23 @@ int main(int argc, char *argv[]) {
         pthread_join(pdu_thread_id, NULL);
         return 0;
     }
-    
-    if (only_send_once_mode) {
-        char *url = NULL, *msgtype = NULL, *txt = NULL;
-        for (i = 1; i < argc; i++) {
-            if (strncmp(argv[i], "--url=", 6) == 0) {
-                url = argv[i] + 6;
-            } else if (strncmp(argv[i], "--msgtype=", 10) == 0) {
-                msgtype = argv[i] + 10;
-            } else if (strncmp(argv[i], "--txt=", 6) == 0) {
-                txt = argv[i] + 6;
-            } else if (strncmp(argv[i], "--number=", 9) == 0) { 
-                number = argv[i] + 9;
-            }
-        }
-        if (!url || !msgtype || !txt) {
-            fprintf(stderr, "Usage: %s --mode=send_once --url=<webhook_url> --msgtype=text --txt=<content> [--number=<value>]\n", argv[0]);
+    if (only_send_once_mode || cli_url || cli_txt) {
+        const char *platform;
+        if (!cli_url || !cli_msgtype || !cli_txt) {
+            fprintf(stderr, "Usage: %s --mode=send_once --url=<webhook_url> --platform=<dingtalk|feishu|wecom|serverchan|discord|telegram|bark|custom> [--custom-ctype=<content-type>] [--custom-body=<template>] --msgtype=text --txt=<content>\n", argv[0]);
             return 1;
         }
-        // 可以在这里使用number参数，并在尾部添加"设备提醒"
-        if (number) {
-            printf("Number parameter provided: %s\n", number);
-            // 在尾部添加"设备提醒"
-            char new_txt[4096];
-            snprintf(new_txt, sizeof(new_txt), "%s设备提醒", txt);
-            txt = strdup(new_txt); // 更新txt指针指向新字符串
-        }
-        
-        char *host = NULL, *path = NULL;
-        parse_url(url, &host, &path);
-        if (!host || !path) {
-            fprintf(stderr, "Invalid webhook URL format.\n");
-            if (host) free(host);
-            if (path) free(path);
-            return 1;
-        }
-        char data[MAX_BUFFER_LEN];
-        if (strcmp(msgtype, "text") == 0) {
-            snprintf(data, sizeof(data), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", txt);
-        } else {
+        if (strcmp(cli_msgtype, "text") != 0) {
             fprintf(stderr, "Only msgtype=text is supported.\n");
-            free(host); free(path);
             return 1;
         }
-        int ret = 0;
-        mbedtls_net_context server_fd;
-        mbedtls_ssl_context ssl;
-        mbedtls_ssl_config conf;
-        mbedtls_entropy_context entropy;
-        mbedtls_ctr_drbg_context ctr_drbg;
-        const char *port = "443";
-        mbedtls_net_init(&server_fd);
-        mbedtls_ssl_init(&ssl);
-        mbedtls_ssl_config_init(&conf);
-        mbedtls_entropy_init(&entropy);
-        mbedtls_ctr_drbg_init(&ctr_drbg);
-        const char *pers = "ssl_client";
-        if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-            print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
-            goto cleanup_once;
-        }
-        if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-            print_mbedtls_error(ret, "mbedtls_net_connect");
-            goto cleanup_once;
-        }
-        if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-            print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
-            goto cleanup_once;
-        }
-        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-        if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-            print_mbedtls_error(ret, "mbedtls_ssl_setup");
-            goto cleanup_once;
-        }
-        mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-        while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                print_mbedtls_error(ret, "mbedtls_ssl_handshake");
-                goto cleanup_once;
-            }
-        }
-        char request_buffer[MAX_BUFFER_LEN];
-        snprintf(request_buffer, sizeof(request_buffer),
-                 "POST %s HTTP/1.1\r\n"
-                 "Host: %s\r\n"
-                 "Content-Type: application/json;charset=utf-8\r\n"
-                 "Content-Length: %zu\r\n"
-                 "\r\n"
-                 "%s",
-                 path, host, strlen(data), data);
-        while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                print_mbedtls_error(ret, "mbedtls_ssl_write");
-                goto cleanup_once;
-            }
-        }
-        unsigned char buf[1024];
-        memset(buf, 0, sizeof(buf));
-        ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-        if (ret > 0) {
-            printf("%s\n", buf);
-        } else if (ret < 0) {
-            print_mbedtls_error(ret, "mbedtls_ssl_read");
-        }
-    cleanup_once:
-        if (host) free(host);
-        if (path) free(path);
-        mbedtls_net_free(&server_fd);
-        mbedtls_ssl_free(&ssl);
-        mbedtls_ssl_config_free(&conf);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
-        return ret;
+        platform = normalize_platform(cli_platform && cli_platform[0] ?
+                                      cli_platform :
+                                      detect_platform_from_url(cli_url));
+        return send_webhook_msg(cli_url, platform, cli_txt,
+                                cli_custom_ctype, cli_custom_body) == 0 ? 0 : 1;
     }
-    
-    // 保持原有兼容模式
-    char *url = NULL, *msgtype = NULL, *txt = NULL;
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--url=", 6) == 0) {
-            url = argv[i] + 6;
-        } else if (strncmp(argv[i], "--msgtype=", 10) == 0) {
-            msgtype = argv[i] + 10;
-        } else if (strncmp(argv[i], "--txt=", 6) == 0) {
-            txt = argv[i] + 6;
-        } else if (strncmp(argv[i], "--number=", 9) == 0) { 
-            number = argv[i] + 9;
-        }
-    }
-    if (!url || !msgtype || !txt) {
-        fprintf(stderr, "Usage: %s --url=<webhook_url> --msgtype=text --txt=<content> [--number=<value>]\n", argv[0]);
-        return 1;
-    }
-    // 可以在这里使用number参数，并在尾部添加"设备提醒"
-    if (number) {
-        printf("Number parameter provided: %s\n", number);
-        // 在尾部添加"设备提醒"
-        char new_txt[4096];
-        snprintf(new_txt, sizeof(new_txt), "%s设备提醒", txt);
-        txt = strdup(new_txt); // 更新txt指针指向新字符串
-    }
-    
-    char *host = NULL, *path = NULL;
-    parse_url(url, &host, &path);
-    if (!host || !path) {
-        fprintf(stderr, "Invalid webhook URL format.\n");
-        if (host) free(host);
-        if (path) free(path);
-        return 1;
-    }
-    char data[MAX_BUFFER_LEN];
-    if (strcmp(msgtype, "text") == 0) {
-        snprintf(data, sizeof(data), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", txt);
-    } else {
-        fprintf(stderr, "Only msgtype=text is supported.\n");
-        free(host); free(path);
-        return 1;
-    }
-    int ret = 0;
-    mbedtls_net_context server_fd;
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    const char *port = "443";
-    mbedtls_net_init(&server_fd);
-    mbedtls_ssl_init(&ssl);
-    mbedtls_ssl_config_init(&conf);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-    const char *pers = "ssl_client";
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
-        goto cleanup;
-    }
-    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_net_connect");
-        goto cleanup;
-    }
-    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
-        goto cleanup;
-    }
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_setup");
-        goto cleanup;
-    }
-    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "mbedtls_ssl_handshake");
-            goto cleanup;
-        }
-    }
-    char request_buffer[MAX_BUFFER_LEN];
-    snprintf(request_buffer, sizeof(request_buffer),
-             "POST %s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Content-Type: application/json;charset=utf-8\r\n"
-             "Content-Length: %zu\r\n"
-             "\r\n"
-             "%s",
-             path, host, strlen(data), data);
-    while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "mbedtls_ssl_write");
-            goto cleanup;
-        }
-    }
-    unsigned char buf[1024];
-    memset(buf, 0, sizeof(buf));
-    ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-    if (ret > 0) {
-        printf("%s\n", buf);
-    } else if (ret < 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_read");
-    }
-cleanup:
-    if (host) free(host);
-    if (path) free(path);
-    mbedtls_net_free(&server_fd);
-    mbedtls_ssl_free(&ssl);
-    mbedtls_ssl_config_free(&conf);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
-    return ret;
+
+    fprintf(stderr, "Usage: %s -w | --mode=send_once --url=<webhook_url> --platform=<dingtalk|feishu|wecom|serverchan|discord|telegram|bark|custom> [--custom-ctype=<content-type>] [--custom-body=<template>] --msgtype=text --txt=<content>\n", argv[0]);
+    return 1;
 }
