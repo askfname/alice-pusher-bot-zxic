@@ -1,9 +1,25 @@
+# Local build output
 /.build/
+
+# Runtime logs and temp files
 *.log
 *.pid
 *.out
 *.err
 *.tmp
+
+# In-tree CMake output generated when rebuilding mbedTLS
+/lib-src/mbedtls-2.1.14/CMakeCache.txt
+/lib-src/mbedtls-2.1.14/CMakeFiles/
+/lib-src/mbedtls-2.1.14/**/CMakeFiles/
+/lib-src/mbedtls-2.1.14/cmake_install.cmake
+/lib-src/mbedtls-2.1.14/**/cmake_install.cmake
+/lib-src/mbedtls-2.1.14/Makefile
+/lib-src/mbedtls-2.1.14/**/Makefile
+!/lib-src/mbedtls-2.1.14/tests/data_files/Makefile
+/lib-src/mbedtls-2.1.14/library/*.a
+
+# Editor and OS noise
 *~
 *.swp
 *.swo

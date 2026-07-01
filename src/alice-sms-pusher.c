@@ -40,10 +40,13 @@
 #define WEB_BODY_MAX 65536
 #define WEB_REQ_MAX 16384
 #define LOG_TAIL_MAX 32768
+#define TARGET_MIFI_PATH "/sbin/zte_mifi"
+#define TARGET_UFI_PATH "/sbin/zte_ufi"
 
 static int g_webui_port = DEFAULT_WEBUI_PORT;
 static volatile sig_atomic_t g_webui_restart_requested;
 static int g_webui_restart_port;
+static char g_target_path[256] = TARGET_MIFI_PATH;
 
 
 // 函数声明
@@ -55,7 +58,8 @@ int send_webhook_msg(const char *webhook, const char *platform,
 void print_mbedtls_error(int ret, const char *msg);
 void parse_url(const char *url, char **host, char **path);
 void signal_handler(int sig);
-int find_zte_mifi_pid(void);
+static int find_process_by_exe_path(const char *exe_path);
+static void sigcont_process_by_path(const char *exe_path);
 static int run_webui(const char *self_path, int port);
 static void json_escape(char *out, size_t outsz, const char *in);
 static void safe_copy(char *dst, size_t dstsz, const char *src);
@@ -193,23 +197,23 @@ static void set_strace_pid_to_file(pid_t pid) {
     }
 }
 
-// 查找 /sbin/zte_mifi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
-int find_zte_mifi_pid() {
+// 查找指定可执行文件路径的进程 pid，返回第一个找到的 pid，找不到返回 -1
+static int find_process_by_exe_path(const char *exe_path) {
     DIR *dir;
     struct dirent *entry;
     char path[256], buf[256];
     int pid = -1;
+    if (!exe_path || !exe_path[0]) return -1;
     dir = opendir("/proc");
     if (!dir) return -1;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_DIR) continue;
         int id = atoi(entry->d_name);
         if (id <= 0) continue;
         snprintf(path, sizeof(path), "/proc/%d/exe", id);
         ssize_t len = readlink(path, buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
-            if (strcmp(buf, "/sbin/zte_mifi") == 0) {
+            if (strcmp(buf, exe_path) == 0) {
                 pid = id;
                 break;
             }
@@ -219,14 +223,27 @@ int find_zte_mifi_pid() {
     return pid;
 }
 
-// strace线程函数 - 执行 strace 跟踪 zte_mifi 进程的 read/write 系统调用
+static void sigcont_process_by_path(const char *exe_path) {
+    int pid = find_process_by_exe_path(exe_path);
+    if (pid > 0)
+        kill(pid, SIGCONT);
+}
+
+// strace线程函数 - 执行 strace 跟踪目标短信进程的 read/write 系统调用
 void* strace_thread_func(void* arg) {
-    (void)arg;
+    const char *target_path = (const char *)arg;
+    char local_target_path[256];
+
+    if (!target_path || !target_path[0])
+        target_path = TARGET_MIFI_PATH;
+    safe_copy(local_target_path, sizeof(local_target_path), target_path);
+    safe_copy(g_target_path, sizeof(g_target_path), local_target_path);
+    target_path = local_target_path;
 
     while (threads_running) {
-        int pid = find_zte_mifi_pid();
+        int pid = find_process_by_exe_path(target_path);
         if (pid <= 0) {
-            fprintf(stderr, "zte_mifi进程未找到\n");
+            fprintf(stderr, "目标短信进程未找到: %s\n", target_path);
             sleep(1);
             continue;
         }
@@ -290,10 +307,7 @@ void* strace_thread_func(void* arg) {
                     kill(strace_pid, SIGKILL);
                     usleep(200*1000);
                 }
-                int ztepid = find_zte_mifi_pid();
-                if (ztepid > 0) {
-                    kill(ztepid, SIGCONT);
-                }
+                sigcont_process_by_path(target_path);
                 break;
             }
 
@@ -998,6 +1012,9 @@ void signal_handler(int sig) {
             kill(strace_pid, SIGKILL);
         }
     }
+    sigcont_process_by_path(g_target_path);
+    sigcont_process_by_path(TARGET_MIFI_PATH);
+    sigcont_process_by_path(TARGET_UFI_PATH);
     
     exit(0);
 }
@@ -1005,6 +1022,8 @@ void signal_handler(int sig) {
 typedef struct {
     char webhook[1024];
     char platform[32];
+    char target_mode[32];
+    char target_path[256];
     char custom_ctype[128];
     char custom_body[2048];
     char num[128];
@@ -1050,6 +1069,43 @@ static const char *platform_label(const char *platform) {
     if (strcmp(platform, "bark") == 0) return "Bark";
     if (strcmp(platform, "custom") == 0) return "自定义";
     return "钉钉";
+}
+
+static const char *normalize_target_mode(const char *mode) {
+    if (!mode || !mode[0]) return "mifi";
+    if (strcmp(mode, "mifi") == 0) return "mifi";
+    if (strcmp(mode, "ufi") == 0) return "ufi";
+    if (strcmp(mode, "custom") == 0) return "custom";
+    return "mifi";
+}
+
+static const char *target_mode_label(const char *mode) {
+    mode = normalize_target_mode(mode);
+    if (strcmp(mode, "ufi") == 0) return "ZTE UFI";
+    if (strcmp(mode, "custom") == 0) return "自定义";
+    return "ZTE MiFi";
+}
+
+static const char *target_default_path(const char *mode) {
+    mode = normalize_target_mode(mode);
+    if (strcmp(mode, "ufi") == 0) return TARGET_UFI_PATH;
+    return TARGET_MIFI_PATH;
+}
+
+static const char *target_selected_attr(const char *mode, const char *value) {
+    return strcmp(normalize_target_mode(mode), value) == 0 ? " selected" : "";
+}
+
+static void resolve_target_path(const web_config_t *cfg, char *out, size_t outsz) {
+    const char *mode = cfg ? normalize_target_mode(cfg->target_mode) : "mifi";
+
+    if (!outsz) return;
+    if (strcmp(mode, "custom") == 0 && cfg && cfg->target_path[0])
+        safe_copy(out, outsz, cfg->target_path);
+    else
+        safe_copy(out, outsz, target_default_path(mode));
+    if (!out[0])
+        safe_copy(out, outsz, TARGET_MIFI_PATH);
 }
 
 static const char *detect_platform_from_url(const char *url) {
@@ -1553,6 +1609,8 @@ static void load_web_config(web_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->port = DEFAULT_WEBUI_PORT;
     safe_copy(cfg->platform, sizeof(cfg->platform), "dingtalk");
+    safe_copy(cfg->target_mode, sizeof(cfg->target_mode), "mifi");
+    safe_copy(cfg->target_path, sizeof(cfg->target_path), TARGET_MIFI_PATH);
     safe_copy(cfg->custom_ctype, sizeof(cfg->custom_ctype),
               "application/json;charset=utf-8");
     safe_copy(cfg->custom_body, sizeof(cfg->custom_body),
@@ -1573,6 +1631,11 @@ static void load_web_config(web_config_t *cfg) {
                       normalize_platform(eq));
             saw_platform = 1;
         }
+        else if (strcmp(line, "target_mode") == 0)
+            safe_copy(cfg->target_mode, sizeof(cfg->target_mode),
+                      normalize_target_mode(eq));
+        else if (strcmp(line, "target_path") == 0)
+            safe_copy(cfg->target_path, sizeof(cfg->target_path), eq);
         else if (strcmp(line, "custom_ctype") == 0)
             safe_copy(cfg->custom_ctype, sizeof(cfg->custom_ctype), eq);
         else if (strcmp(line, "custom_body") == 0)
@@ -1597,6 +1660,12 @@ static void load_web_config(web_config_t *cfg) {
         safe_copy(cfg->platform, sizeof(cfg->platform),
                   normalize_platform(detect_platform_from_url(cfg->webhook)));
     }
+    safe_copy(cfg->target_mode, sizeof(cfg->target_mode),
+              normalize_target_mode(cfg->target_mode));
+    remove_newlines(cfg->target_path);
+    if (!cfg->target_path[0] || strcmp(cfg->target_mode, "custom") != 0)
+        safe_copy(cfg->target_path, sizeof(cfg->target_path),
+                  target_default_path(cfg->target_mode));
 }
 
 static int save_web_config(const web_config_t *cfg) {
@@ -1614,6 +1683,8 @@ static int save_web_config(const web_config_t *cfg) {
     if (!fp) return -1;
     fprintf(fp, "webhook=%s\n", cfg->webhook);
     fprintf(fp, "platform=%s\n", normalize_platform(cfg->platform));
+    fprintf(fp, "target_mode=%s\n", normalize_target_mode(cfg->target_mode));
+    fprintf(fp, "target_path=%s\n", cfg->target_path);
     fprintf(fp, "custom_ctype=%s\n", cfg->custom_ctype);
     fprintf(fp, "custom_body=%s\n", esc_body);
     fprintf(fp, "num=%s\n", cfg->num);
@@ -1815,17 +1886,21 @@ static pid_t service_pid(void) {
 
 static void cleanup_strace_child(void) {
     pid_t strace_pid = get_strace_pid_from_file();
+    web_config_t cfg;
+    char target_path[256];
+
     if (strace_pid > 0 && process_alive(strace_pid)) {
         kill(strace_pid, SIGTERM);
         usleep(200 * 1000);
         if (process_alive(strace_pid))
             kill(strace_pid, SIGKILL);
     }
-    {
-        int ztepid = find_zte_mifi_pid();
-        if (ztepid > 0)
-            kill(ztepid, SIGCONT);
-    }
+    load_web_config(&cfg);
+    resolve_target_path(&cfg, target_path, sizeof(target_path));
+    sigcont_process_by_path(target_path);
+    sigcont_process_by_path(g_target_path);
+    sigcont_process_by_path(TARGET_MIFI_PATH);
+    sigcont_process_by_path(TARGET_UFI_PATH);
 }
 
 static int stop_service(void) {
@@ -1872,7 +1947,9 @@ static int start_service(const char *self_path, const web_config_t *cfg) {
         char custom_body_arg[2300];
         char head_arg[360];
         char tail_arg[360];
-        char *args[14];
+        char target_path[256];
+        char target_arg[340];
+        char *args[16];
         int n = 0;
         int logfd;
 
@@ -1896,10 +1973,13 @@ static int start_service(const char *self_path, const web_config_t *cfg) {
         snprintf(num_arg, sizeof(num_arg), "--num=%s", cfg->num);
         snprintf(head_arg, sizeof(head_arg), "--headtxt=%s", cfg->headtxt);
         snprintf(tail_arg, sizeof(tail_arg), "--tailtxt=%s", cfg->tailtxt);
+        resolve_target_path(cfg, target_path, sizeof(target_path));
+        snprintf(target_arg, sizeof(target_arg), "--target-path=%s", target_path);
         args[n++] = (char *)self_path;
         args[n++] = "--mode=service_start";
         args[n++] = url_arg;
         args[n++] = platform_arg;
+        args[n++] = target_arg;
         if (strcmp(normalize_platform(cfg->platform), "custom") == 0) {
             args[n++] = custom_ctype_arg;
             args[n++] = custom_body_arg;
@@ -2051,6 +2131,7 @@ static void append_page_end(char *body, size_t bodysz) {
     buf_append(body, bodysz,
         "</main></div><script>"
         "function toggleCustom(){var s=document.getElementById('platformSelect'),b=document.getElementById('customFields');if(!s||!b)return;b.className=s.value==='custom'?'custombox show':'custombox';}"
+        "function toggleTarget(){var s=document.getElementById('targetModeSelect'),b=document.getElementById('targetCustomFields');if(!s||!b)return;b.className=s.value==='custom'?'custombox show':'custombox';}"
         "function fetchMsisdn(b){var i=document.getElementById('numInput'),m=document.getElementById('numMsg');"
         "if(m){m.textContent='正在读取 nv show...';m.className='hint';}"
         "if(b){b.disabled=true;b.textContent='获取中';}"
@@ -2064,7 +2145,7 @@ static void append_page_end(char *body, size_t bodysz) {
         "function barkKey(u){var s=(u||''),i=s.indexOf('://');if(i>=0)s=s.slice(i+3);i=s.indexOf('/');if(i<0)return '';s=s.slice(i+1);if(!s||s.indexOf('push')===0)return '';return s.split(/[/?#]/)[0];}"
         "function sampleText(){var n=document.getElementById('numInput'),num=n&&n.value?n.value:'N/A';return '接收短信设备手机号:'+num+'\\n[pdu解码后的信息]\\n短消息服务中心:+8613800755500\\n发件人:10086\\n时间戳:26/06/30 12:00:00\\n短信内容:Alice Pusher Bot 示例短信';}"
         "function updatePreview(){var h=document.getElementById('headInput'),t=document.getElementById('tailInput'),p=document.getElementById('msgPreview'),s=document.getElementById('platformSelect'),w=document.getElementById('webhookInput'),ct=document.getElementById('ctypeInput'),cb=document.getElementById('customBodyInput');if(!p)return;var a=[],text,plat=s?s.value:'dingtalk',ctype='application/json;charset=utf-8',payload='',jt,key,tmpl;if(h&&h.value)a.push(h.value);a.push(sampleText());if(t&&t.value)a.push(t.value);text=a.join('\\n');if(plat==='serverchan'){ctype='application/x-www-form-urlencoded';payload='title=Alice%20Pusher&desp='+enc(text);}else if(plat==='telegram'){ctype='application/x-www-form-urlencoded';payload='text='+enc(text);}else if(plat==='custom'){ctype=(ct&&ct.value)||'application/json;charset=utf-8';tmpl=(cb&&cb.value)||'{\"text\":\"{{json_text}}\"}';payload=tmpl.split('{{json_text}}').join(jesc(text)).split('{{url_text}}').join(enc(text)).split('{{text}}').join(text);}else{jt=jesc(text);if(plat==='feishu')payload='{\"msg_type\":\"text\",\"content\":{\"text\":\"'+jt+'\"}}';else if(plat==='discord')payload='{\"content\":\"'+jt+'\"}';else if(plat==='bark'){key=barkKey(w&&w.value);payload=key?'{\"title\":\"Alice Pusher\",\"body\":\"'+jt+'\",\"device_key\":\"'+jesc(key)+'\"}':'需要填写 Bark URL 以提取 device_key';}else payload='{\"msgtype\":\"text\",\"text\":{\"content\":\"'+jt+'\"}}';}p.textContent='最终文本:\\n'+text+'\\n\\nContent-Type:\\n'+ctype+'\\n\\nPayload:\\n'+payload;}"
-        "toggleCustom();updatePreview();"
+        "toggleCustom();toggleTarget();updatePreview();"
         "</script></body></html>");
 }
 
@@ -2073,8 +2154,10 @@ static void render_home(int fd, const char *message) {
     autostart_status_t ast;
     char *body = calloc(1, WEB_BODY_MAX);
     pid_t spid, strpid;
-    int ztepid;
+    int target_pid;
+    char target_path[256];
     char esc_num[256], esc_hook[256], esc_platform[128];
+    char esc_target_label[128], esc_target_path[512];
     const char *auto_label;
     const char *auto_detail;
     const char *auto_payload;
@@ -2088,10 +2171,14 @@ static void render_home(int fd, const char *message) {
     spid = service_pid();
     strpid = get_strace_pid_from_file();
     if (!process_alive(strpid)) strpid = 0;
-    ztepid = find_zte_mifi_pid();
+    resolve_target_path(&cfg, target_path, sizeof(target_path));
+    target_pid = find_process_by_exe_path(target_path);
     html_escape(esc_num, sizeof(esc_num), cfg.num[0] ? cfg.num : "-");
     html_escape(esc_hook, sizeof(esc_hook), cfg.webhook[0] ? "已配置" : "未配置");
     html_escape(esc_platform, sizeof(esc_platform), platform_label(cfg.platform));
+    html_escape(esc_target_label, sizeof(esc_target_label),
+                target_mode_label(cfg.target_mode));
+    html_escape(esc_target_path, sizeof(esc_target_path), target_path);
     if (ast.run_ready && ast.bin_ready)
         auto_payload = ".run 与二进制已就绪";
     else if (ast.run_ready)
@@ -2118,7 +2205,9 @@ static void render_home(int fd, const char *message) {
         "<div class=\"kv\"><div class=\"k\">服务状态</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">服务 PID</div><div class=\"v\">%ld</div></div>"
         "<div class=\"kv\"><div class=\"k\">strace PID</div><div class=\"v\">%ld</div></div>"
-        "<div class=\"kv\"><div class=\"k\">zte_mifi PID</div><div class=\"v\">%d</div></div>"
+        "<div class=\"kv\"><div class=\"k\">短信进程</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">进程路径</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">目标 PID</div><div class=\"v\">%d</div></div>"
         "<div class=\"kv\"><div class=\"k\">推送平台</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">Webhook</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">设备手机号</div><div class=\"v\">%s</div></div>"
@@ -2141,7 +2230,8 @@ static void render_home(int fd, const char *message) {
         "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\">关闭自启动</button></form>"
         "</div><div class=\"hint\">持久路径：" DEFAULT_RUN_PATH " / " DEFAULT_BIN_PATH "</div></div></section>",
         spid > 0 ? "运行中" : "未运行", (long)spid, (long)strpid,
-        ztepid > 0 ? ztepid : 0, esc_platform, esc_hook, esc_num,
+        esc_target_label, esc_target_path, target_pid > 0 ? target_pid : 0,
+        esc_platform, esc_hook, esc_num,
         auto_label, auto_detail, auto_payload,
         ast.script_ready ? "已写入" : "未写入",
         ast.hook_ready ? "已安装" : "未安装");
@@ -2155,6 +2245,7 @@ static void render_config(int fd, const char *message) {
     char *body = calloc(1, WEB_BODY_MAX);
     char *custom_body = calloc(1, 12288);
     char webhook[2048], num[256], head[1024], tail[1024];
+    char target_path[512];
     char sample_body[1024], sample_final[2048], sample_payload[4096];
     char sample_ctype[160], sample_preview[8192], sample_preview_esc[20000];
     char custom_ctype[256];
@@ -2171,6 +2262,7 @@ static void render_config(int fd, const char *message) {
     html_escape(num, sizeof(num), cfg.num);
     html_escape(head, sizeof(head), cfg.headtxt);
     html_escape(tail, sizeof(tail), cfg.tailtxt);
+    html_escape(target_path, sizeof(target_path), cfg.target_path);
     html_escape(custom_ctype, sizeof(custom_ctype), cfg.custom_ctype);
     html_escape(custom_body, 12288, cfg.custom_body);
     snprintf(sample_body, sizeof(sample_body),
@@ -2202,6 +2294,15 @@ static void render_config(int fd, const char *message) {
         "</div></section>"
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">推送配置</div></div><div class=\"pad\">"
         "<form method=\"post\" action=\"/save_config\">"
+        "<label>短信进程</label><select id=\"targetModeSelect\" name=\"target_mode\" onchange=\"toggleTarget()\">"
+        "<option value=\"mifi\"%s>ZTE MiFi（/sbin/zte_mifi）</option>"
+        "<option value=\"ufi\"%s>ZTE UFI（/sbin/zte_ufi）</option>"
+        "<option value=\"custom\"%s>自定义路径</option>"
+        "</select>"
+        "<div id=\"targetCustomFields\" class=\"custombox\">"
+        "<label>自定义进程路径</label><input name=\"target_path\" value=\"%s\" placeholder=\"/sbin/zte_mifi\">"
+        "<div class=\"hint\">填写 /proc/&lt;pid&gt;/exe 指向的可执行文件路径。保存后重启服务生效。</div>"
+        "</div>"
         "<label>推送平台</label><select id=\"platformSelect\" name=\"platform\" onchange=\"toggleCustom();updatePreview()\">"
         "<option value=\"dingtalk\"%s>钉钉</option>"
         "<option value=\"feishu\"%s>飞书</option>"
@@ -2235,6 +2336,10 @@ static void render_config(int fd, const char *message) {
         "<div class=\"tpl\"><div class=\"tplname\">自定义</div><div class=\"tpltext\">自行填写 Content-Type 与消息体模板。JSON 示例：<span class=\"tplcode\">{&quot;text&quot;:&quot;{{json_text}}&quot;}</span>；表单示例：<span class=\"tplcode\">title=Alice&amp;desp={{url_text}}</span>。</div></div>"
         "</div></section>",
         port,
+        target_selected_attr(cfg.target_mode, "mifi"),
+        target_selected_attr(cfg.target_mode, "ufi"),
+        target_selected_attr(cfg.target_mode, "custom"),
+        target_path,
         selected_attr(cfg.platform, "dingtalk"),
         selected_attr(cfg.platform, "feishu"),
         selected_attr(cfg.platform, "wecom"),
@@ -2286,7 +2391,7 @@ static void render_about(int fd) {
         "<section class=\"panel\"><div class=\"pad about\">"
         "<img class=\"avatar\" src=\"/avatar.jpg\" alt=\"avatar\">"
         "<div><div class=\"aboutname\">alice-pusher-bot-zxic</div>"
-        "<div class=\"hint\">ZTE MiFi 短信捕获与 Webhook 推送工具</div>"
+        "<div class=\"hint\">ZTE MiFi/UFI 短信捕获与 Webhook 推送工具</div>"
         "<div class=\"labelrow\">项目地址：<a class=\"repo\" href=\"https://github.com/Amamiyashi0n/alice-pusher-bot-zxic\">"
         "github.com/Amamiyashi0n/alice-pusher-bot-zxic</a></div>"
         "<div class=\"signature\">世间自有尘寰在，我亦独吟游且歌。</div>"
@@ -2323,23 +2428,32 @@ static void render_status_json(int fd) {
     web_config_t cfg;
     char num[256];
     char platform[96];
+    char target_mode[64];
+    char target_path[512];
+    char target_path_raw[256];
     pid_t spid = service_pid();
     pid_t strpid = get_strace_pid_from_file();
-    int ztepid = find_zte_mifi_pid();
-    char body[1024];
+    int target_pid;
+    char body[2048];
 
     load_web_config(&cfg);
     if (!process_alive(strpid)) strpid = 0;
+    resolve_target_path(&cfg, target_path_raw, sizeof(target_path_raw));
+    target_pid = find_process_by_exe_path(target_path_raw);
     json_escape(num, sizeof(num), cfg.num);
     json_escape(platform, sizeof(platform), platform_label(cfg.platform));
+    json_escape(target_mode, sizeof(target_mode), target_mode_label(cfg.target_mode));
+    json_escape(target_path, sizeof(target_path), target_path_raw);
     snprintf(body, sizeof(body),
         "{\"service_running\":%s,\"service_pid\":%ld,"
-        "\"strace_pid\":%ld,\"zte_mifi_pid\":%d,"
+        "\"strace_pid\":%ld,\"target_pid\":%d,\"zte_mifi_pid\":%d,"
+        "\"target_mode\":\"%s\",\"target_path\":\"%s\","
         "\"webhook_configured\":%s,\"platform\":\"%s\","
         "\"num\":\"%s\",\"port\":%d}\n",
         spid > 0 ? "true" : "false", (long)spid, (long)strpid,
-        ztepid > 0 ? ztepid : 0, cfg.webhook[0] ? "true" : "false",
-        platform, num, g_webui_port);
+        target_pid > 0 ? target_pid : 0,
+        target_pid > 0 ? target_pid : 0, target_mode, target_path,
+        cfg.webhook[0] ? "true" : "false", platform, num, g_webui_port);
     http_send(fd, 200, "OK", "application/json; charset=utf-8", body);
 }
 
@@ -2365,6 +2479,8 @@ static void handle_save_config(int fd, const char *body) {
     saved_port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
     form_value(body, "webhook", cfg.webhook, sizeof(cfg.webhook));
     form_value(body, "platform", cfg.platform, sizeof(cfg.platform));
+    form_value(body, "target_mode", cfg.target_mode, sizeof(cfg.target_mode));
+    form_value(body, "target_path", cfg.target_path, sizeof(cfg.target_path));
     form_value(body, "custom_ctype", cfg.custom_ctype,
                sizeof(cfg.custom_ctype));
     form_value(body, "custom_body", cfg.custom_body,
@@ -2376,6 +2492,16 @@ static void handle_save_config(int fd, const char *body) {
     remove_newlines(cfg.webhook);
     safe_copy(cfg.platform, sizeof(cfg.platform),
               normalize_platform(cfg.platform));
+    safe_copy(cfg.target_mode, sizeof(cfg.target_mode),
+              normalize_target_mode(cfg.target_mode));
+    remove_newlines(cfg.target_path);
+    if (strcmp(cfg.target_mode, "custom") != 0) {
+        safe_copy(cfg.target_path, sizeof(cfg.target_path),
+                  target_default_path(cfg.target_mode));
+    } else if (!cfg.target_path[0] || cfg.target_path[0] != '/') {
+        render_config(fd, "自定义进程路径必须填写绝对路径，例如 /sbin/zte_mifi。");
+        return;
+    }
     remove_newlines(cfg.custom_ctype);
     if (!cfg.custom_ctype[0])
         safe_copy(cfg.custom_ctype, sizeof(cfg.custom_ctype),
@@ -2704,6 +2830,7 @@ int main(int argc, char *argv[]) {
     char *cli_txt = NULL;
     char *cli_headtxt = NULL;
     char *cli_tailtxt = NULL;
+    char *cli_target_path = NULL;
     int i;
 
     load_web_config(&saved_cfg);
@@ -2753,6 +2880,12 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
             cli_tailtxt = argv[i] + 10;
         }
+        if (strncmp(argv[i], "--target-path=", 14) == 0) {
+            cli_target_path = argv[i] + 14;
+        }
+        if (strncmp(argv[i], "--targetbin=", 12) == 0) {
+            cli_target_path = argv[i] + 12;
+        }
     }
     if (webui_mode) {
         char self_path[512];
@@ -2768,6 +2901,9 @@ int main(int argc, char *argv[]) {
         platform = normalize_platform(cli_platform && cli_platform[0] ?
                                       cli_platform :
                                       detect_platform_from_url(cli_url));
+        if (!cli_target_path || !cli_target_path[0])
+            cli_target_path = TARGET_MIFI_PATH;
+        safe_copy(g_target_path, sizeof(g_target_path), cli_target_path);
         if (manual_msisdn && manual_msisdn[0]) {
             strncpy(device_msisdn, manual_msisdn, sizeof(device_msisdn) - 1);
             device_msisdn[sizeof(device_msisdn) - 1] = 0;
@@ -2779,11 +2915,11 @@ int main(int argc, char *argv[]) {
             }
         }
         printf("Alice Pushbot - Service mode starting.\n");
-        printf("Target: /sbin/zte_mifi (strace attached).\n");
+        printf("Target: %s (strace attached).\n", g_target_path);
         printf("Press Ctrl+C to stop.\n");
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
-        if (pthread_create(&strace_thread_id, NULL, strace_thread_func, cli_url) != 0) {
+        if (pthread_create(&strace_thread_id, NULL, strace_thread_func, g_target_path) != 0) {
             perror("Failed to create strace thread");
             return 1;
         }
