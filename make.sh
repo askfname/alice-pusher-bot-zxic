@@ -9,7 +9,8 @@ STRIP="${STRIP:-${CROSS_PREFIX}strip}"
 CFLAGS="${CFLAGS:--Os -ffunction-sections -fdata-sections}"
 LDFLAGS="${LDFLAGS:--Wl,--gc-sections}"
 MBEDTLS_DIR="$ROOT_DIR/lib-src/mbedtls-2.1.14"
-SRC_FILE="$ROOT_DIR/src/alice-sms-pusher.c"
+WEBUI_SRC="$ROOT_DIR/src/webui.c"
+ENGINE_SRC="$ROOT_DIR/src/alice-pusher-bot.c"
 BUILD_DIR="$ROOT_DIR/.build"
 OUTPUT_DIR="$ROOT_DIR/output"
 TARGET="$OUTPUT_DIR/alice-pusher-bot"
@@ -62,7 +63,8 @@ build_mbedtls_if_needed() {
 
 need_exec "$CC"
 need_exec "$STRIP"
-need_file "$SRC_FILE"
+need_file "$WEBUI_SRC"
+need_file "$ENGINE_SRC"
 need_file "$EMBED_ASSET"
 need_file "$SELF_EXTRACT"
 need_file "$AVATAR_SRC"
@@ -75,7 +77,7 @@ python3 "$EMBED_ASSET" "$SPONSOR_SRC" "$BUILD_DIR/sponsor_asset.h" sponsor_image
 
 build_mbedtls_if_needed
 
-"$CC" $CFLAGS -I"$MBEDTLS_DIR/include" "$SRC_FILE" -o "$TARGET" \
+"$CC" $CFLAGS -I"$MBEDTLS_DIR/include" "$WEBUI_SRC" "$ENGINE_SRC" -o "$TARGET" \
 	$LDFLAGS -L"$MBEDTLS_DIR/library" \
 	-lmbedtls -lmbedx509 -lmbedcrypto -pthread
 "$STRIP" --strip-all "$TARGET"

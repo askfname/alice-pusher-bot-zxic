@@ -1,0 +1,57 @@
+#ifndef ALICE_PUSHER_BOT_H
+#define ALICE_PUSHER_BOT_H
+
+#include <stddef.h>
+#include <sys/types.h>
+
+#define ALICE_TARGET_MIFI_PATH "/sbin/zte_mifi"
+#define ALICE_TARGET_UFI_PATH "/sbin/zte_ufi"
+
+typedef struct {
+    const char *webhook;
+    const char *platform;
+    const char *target_path;
+    const char *custom_ctype;
+    const char *custom_body;
+    const char *num;
+    const char *headtxt;
+    const char *tailtxt;
+} alice_engine_service_config_t;
+
+typedef void (*alice_engine_log_fn)(void *ctx, const char *line);
+
+void alice_engine_set_log_callback(alice_engine_log_fn fn, void *ctx);
+const char *alice_engine_normalize_platform(const char *platform);
+const char *alice_engine_detect_platform_from_url(const char *url);
+void alice_engine_build_push_message(char *out, size_t outsz,
+                                     const char *headtxt,
+                                     const char *body,
+                                     const char *tailtxt);
+int alice_engine_build_webhook_payload(const char *webhook,
+                                       const char *platform,
+                                       const char *txt,
+                                       const char *custom_ctype,
+                                       const char *custom_body,
+                                       char *payload,
+                                       size_t payload_sz,
+                                       char *ctype,
+                                       size_t ctype_sz);
+int alice_engine_send_webhook_msg(const char *webhook,
+                                  const char *platform,
+                                  const char *txt,
+                                  const char *custom_ctype,
+                                  const char *custom_body);
+int alice_engine_send_once(const char *webhook,
+                           const char *platform,
+                           const char *txt,
+                           const char *custom_ctype,
+                           const char *custom_body);
+int alice_engine_start_service(const alice_engine_service_config_t *cfg);
+void alice_engine_stop(void);
+void alice_engine_cleanup_strace_child(const char *target_path);
+int alice_engine_load_device_msisdn(char *out, size_t outsz);
+pid_t alice_engine_get_strace_pid(void);
+int alice_engine_process_alive(pid_t pid);
+int alice_engine_find_process_by_exe_path(const char *exe_path);
+
+#endif

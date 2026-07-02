@@ -1,5 +1,4 @@
 #include <time.h>
-#include <regex.h>
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -12,62 +11,58 @@
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/version.h>
+#include "alice-pusher-bot.h"
 #include <pthread.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <ctype.h>
-
+#include <stdarg.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <limits.h>
 #define MAX_BUFFER_LEN 4096
+#define TARGET_MIFI_PATH ALICE_TARGET_MIFI_PATH
+#define TARGET_UFI_PATH ALICE_TARGET_UFI_PATH
 
-// 平台类型枚举
-typedef enum {
-    PLATFORM_WECOM,     // 企业微信
-    PLATFORM_DINGTALK,  // 钉钉
-    PLATFORM_BARK,      // Bark (iOS推送)
-    PLATFORM_FEISHU,    // 飞书
-    PLATFORM_UNKNOWN    // 未知平台
-} webhook_platform_t;
+static char g_target_path[256] = TARGET_MIFI_PATH;
 
-// 通过URL特征自动检测平台类型
-static webhook_platform_t detect_platform(const char *url) {
-    if (strstr(url, "qyapi.weixin.qq.com")) {
-        return PLATFORM_WECOM;
-    }
-    if (strstr(url, "oapi.dingtalk.com")) {
-        return PLATFORM_DINGTALK;
-    }
-    if (strstr(url, "api.day.app")) {
-        return PLATFORM_BARK;
-    }
-    if (strstr(url, "open.feishu.cn") || strstr(url, "open.larkoffice.com")) {
-        return PLATFORM_FEISHU;
-    }
-    return PLATFORM_UNKNOWN;
-}
 
 // 函数声明
 static pid_t get_strace_pid_from_file(void);
 static void set_strace_pid_to_file(pid_t pid);
-void send_dingtalk_msg(const char *webhook, const char *txt);
-void send_wecom_msg(const char *webhook, const char *txt);
-void send_bark_msg(const char *webhook, const char *txt);
-void send_feishu_msg(const char *webhook, const char *txt);
-void send_webhook_msg(const char *webhook, const char *txt);
-void print_mbedtls_error(int ret, const char *msg);
-void parse_url(const char *url, char **host, char **path);
-void signal_handler(int sig);
-int find_zte_mifi_pid(void);
-void trace_zte_mifi(void);
-void rerun_strace_zte_mifi(void);
+int alice_engine_send_webhook_msg(const char *webhook, const char *platform,
+                                    const char *txt, const char *custom_ctype,
+                                    const char *custom_body);
+static void print_mbedtls_error(int ret, const char *msg);
+static void parse_url(const char *url, char **host, char **path);
+static void engine_signal_handler(int sig);
+static int find_process_by_exe_path(const char *exe_path);
+static void sigcont_process_by_path(const char *exe_path);
+static void json_escape(char *out, size_t outsz, const char *in);
+static void safe_copy(char *dst, size_t dstsz, const char *src);
+static void load_device_msisdn_from_nv_show(void);
+static void* strace_thread_func(void* arg);
+static void* pdu_thread_func(void* arg);
+static void engine_log(const char *fmt, ...);
 
 // 线程控制变量
 static volatile int threads_running = 1;
 static pthread_t strace_thread_id;
 static pthread_t pdu_thread_id;
+static char device_msisdn[64] = "";
+static alice_engine_log_fn g_log_fn;
+static void *g_log_ctx;
 
-static void process_strace_line_for_sms(const char *line, const char *webhook, const char *headtxt, const char *tailtxt);
+static void process_strace_line_for_sms(const char *line, const char *webhook,
+                                        const char *platform,
+                                        const char *custom_ctype,
+                                        const char *custom_body,
+                                        const char *headtxt,
+                                        const char *tailtxt);
 
 typedef struct {
     char lines[256][MAX_BUFFER_LEN];
@@ -85,6 +80,29 @@ static strace_line_queue_t g_strace_queue = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER
 };
+
+void alice_engine_set_log_callback(alice_engine_log_fn fn, void *ctx) {
+    g_log_fn = fn;
+    g_log_ctx = ctx;
+}
+
+static void engine_log(const char *fmt, ...) {
+    char line[2048];
+    va_list ap;
+
+    if (!fmt)
+        return;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    if (g_log_fn) {
+        g_log_fn(g_log_ctx, line);
+        return;
+    }
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
+}
 
 static void strace_queue_push_line(const char *line) {
     pthread_mutex_lock(&g_strace_queue.mutex);
@@ -129,6 +147,18 @@ static int strace_queue_pop_line(char *out, size_t outlen, int timeout_ms) {
     return 1;
 }
 
+static time_t get_next_midnight_epoch(void) {
+    time_t now = time(NULL);
+    struct tm *tm_now_ptr = localtime(&now);
+    if (!tm_now_ptr) return now + 24 * 3600;
+    struct tm tm_now = *tm_now_ptr;
+    tm_now.tm_hour = 0;
+    tm_now.tm_min = 0;
+    tm_now.tm_sec = 0;
+    time_t today_midnight = mktime(&tm_now);
+    return today_midnight + 24 * 3600;
+}
+
 static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *out_read_fd) {
     int fds[2];
     if (pipe(fds) != 0) return -1;
@@ -162,63 +192,6 @@ static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *ou
     return 0;
 }
 
-void trace_zte_mifi() {
-    int pid = find_zte_mifi_pid();
-    if (pid <= 0) {
-        fprintf(stderr, "zte_mifi进程未找到\n");
-        return;
-    }
-    pid_t strace_pid = 0;
-    int read_fd = -1;
-    if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
-        perror("start_strace_with_pipe");
-        return;
-    }
-    set_strace_pid_to_file(strace_pid);
-
-    char partial[MAX_BUFFER_LEN];
-    size_t partial_len = 0;
-    while (1) {
-        struct pollfd pfd;
-        memset(&pfd, 0, sizeof(pfd));
-        pfd.fd = read_fd;
-        pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, 500);
-        if (pr > 0 && (pfd.revents & POLLIN)) {
-            char buf[1024];
-            ssize_t n = read(read_fd, buf, sizeof(buf));
-            if (n > 0) {
-                size_t i;
-                for (i = 0; i < (size_t)n; i++) {
-                    char c = buf[i];
-                    if (partial_len + 1 < sizeof(partial)) {
-                        partial[partial_len++] = c;
-                    }
-                    if (c == '\n') {
-                        partial[partial_len] = 0;
-                        fputs(partial, stdout);
-                        partial_len = 0;
-                    }
-                    if (partial_len + 1 >= sizeof(partial)) {
-                        partial[partial_len] = 0;
-                        fputs(partial, stdout);
-                        partial_len = 0;
-                    }
-                }
-            } else if (n == 0) {
-                break;
-            } else {
-                if (errno != EAGAIN && errno != EINTR) break;
-            }
-        }
-        int status = 0;
-        pid_t w = waitpid(strace_pid, &status, WNOHANG);
-        if (w == strace_pid) break;
-    }
-    close(read_fd);
-    waitpid(strace_pid, NULL, 0);
-}
-
 // 用文件记录strace子进程pid，便于跨进程kill
 static pid_t get_strace_pid_from_file() {
     FILE *fp = fopen("/tmp/zte_strace.pid", "r");
@@ -236,49 +209,23 @@ static void set_strace_pid_to_file(pid_t pid) {
     }
 }
 
-// 立即清空 /tmp/zte_log.txt 并重启 strace 跟踪（优雅kill，保护zte_mifi）
-void rerun_strace_zte_mifi() {
-    pid_t oldpid = get_strace_pid_from_file();
-    if (oldpid > 0) {
-        // 优先SIGTERM优雅退出
-        kill(oldpid, SIGTERM);
-        int wait_count = 0;
-        while (wait_count < 10) { // 最多等1秒
-            if (kill(oldpid, 0) != 0) break; // 已退出
-            usleep(100*1000);
-            wait_count++;
-        }
-        // 若还在则SIGKILL
-        if (kill(oldpid, 0) == 0) {
-            kill(oldpid, SIGKILL);
-            usleep(200*1000);
-        }
-        // 杀完strace后，给zte_mifi发SIGCONT，防止其被挂起
-        int ztepid = find_zte_mifi_pid();
-        if (ztepid > 0) {
-            kill(ztepid, SIGCONT);
-        }
-    }
-}
-
-// 查找 /sbin/zte_mifi 或 /sbin/zte_ufi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
-int find_zte_mifi_pid() {
+// 查找指定可执行文件路径的进程 pid，返回第一个找到的 pid，找不到返回 -1
+static int find_process_by_exe_path(const char *exe_path) {
     DIR *dir;
     struct dirent *entry;
     char path[256], buf[256];
-    FILE *fp;
     int pid = -1;
+    if (!exe_path || !exe_path[0]) return -1;
     dir = opendir("/proc");
     if (!dir) return -1;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_DIR) continue;
         int id = atoi(entry->d_name);
         if (id <= 0) continue;
         snprintf(path, sizeof(path), "/proc/%d/exe", id);
         ssize_t len = readlink(path, buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
-            if (strcmp(buf, "/sbin/zte_mifi") == 0 || strcmp(buf, "/sbin/zte_ufi") == 0) {
+            if (strcmp(buf, exe_path) == 0) {
                 pid = id;
                 break;
             }
@@ -288,14 +235,221 @@ int find_zte_mifi_pid() {
     return pid;
 }
 
-// strace线程函数 - 执行 strace 跟踪 zte_mifi 进程的 read/write 系统调用
-void* strace_thread_func(void* arg) {
-    char* webhook = (char*)arg;
+static void sigcont_process_by_path(const char *exe_path) {
+    int pid = find_process_by_exe_path(exe_path);
+    if (pid > 0)
+        kill(pid, SIGCONT);
+}
+
+
+
+static void reset_strace_queue(void) {
+    pthread_mutex_lock(&g_strace_queue.mutex);
+    g_strace_queue.head = 0;
+    g_strace_queue.tail = 0;
+    g_strace_queue.count = 0;
+    pthread_cond_broadcast(&g_strace_queue.cond);
+    pthread_mutex_unlock(&g_strace_queue.mutex);
+}
+
+static void safe_copy(char *dst, size_t dstsz, const char *src) {
+    if (!dstsz) return;
+    if (!src) src = "";
+    strncpy(dst, src, dstsz - 1);
+    dst[dstsz - 1] = 0;
+}
+
+static void json_escape(char *out, size_t outsz, const char *in) {
+    size_t used = 0;
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        unsigned char c = (unsigned char)*in++;
+        if (c == '"' || c == '\\') {
+            if (used + 2 >= outsz) break;
+            out[used++] = '\\';
+            out[used++] = (char)c;
+        } else if (c == '\n' || c == '\r') {
+            if (used + 2 >= outsz) break;
+            out[used++] = '\\';
+            out[used++] = 'n';
+        } else if (c < 0x20) {
+            continue;
+        } else {
+            out[used++] = (char)c;
+        }
+    }
+    out[used] = 0;
+}
+
+const char *alice_engine_normalize_platform(const char *platform) {
+    if (!platform || !platform[0]) return "dingtalk";
+    if (strcmp(platform, "dingtalk") == 0) return "dingtalk";
+    if (strcmp(platform, "feishu") == 0) return "feishu";
+    if (strcmp(platform, "wecom") == 0) return "wecom";
+    if (strcmp(platform, "serverchan") == 0) return "serverchan";
+    if (strcmp(platform, "discord") == 0) return "discord";
+    if (strcmp(platform, "telegram") == 0) return "telegram";
+    if (strcmp(platform, "bark") == 0) return "bark";
+    if (strcmp(platform, "custom") == 0) return "custom";
+    return "dingtalk";
+}
+
+const char *alice_engine_detect_platform_from_url(const char *url) {
+    if (!url) return "dingtalk";
+    if (strstr(url, "open.feishu.cn") || strstr(url, "feishu.cn/"))
+        return "feishu";
+    if (strstr(url, "qyapi.weixin.qq.com") ||
+        strstr(url, "work.weixin.qq.com"))
+        return "wecom";
+    if (strstr(url, "sctapi.ftqq.com") || strstr(url, "sc.ftqq.com"))
+        return "serverchan";
+    if (strstr(url, "discord.com/api/webhooks/") ||
+        strstr(url, "discordapp.com/api/webhooks/"))
+        return "discord";
+    if (strstr(url, "api.telegram.org/bot"))
+        return "telegram";
+    if (strstr(url, "api.day.app"))
+        return "bark";
+    return "dingtalk";
+}
+
+int alice_engine_send_once(const char *webhook,
+                           const char *platform,
+                           const char *txt,
+                           const char *custom_ctype,
+                           const char *custom_body) {
+    const char *p;
+
+    if (!webhook || !webhook[0] || !txt)
+        return -1;
+    p = alice_engine_normalize_platform(platform && platform[0] ?
+                                        platform :
+                                        alice_engine_detect_platform_from_url(webhook));
+    return alice_engine_send_webhook_msg(webhook, p, txt,
+                                         custom_ctype, custom_body);
+}
+
+int alice_engine_start_service(const alice_engine_service_config_t *cfg) {
+    const char *platform;
+    const char *target_path;
+    char target_path_buf[256];
+    char *pdu_args[6];
+
+    if (!cfg || !cfg->webhook || !cfg->webhook[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    platform = alice_engine_normalize_platform(cfg->platform && cfg->platform[0] ?
+                                               cfg->platform :
+                                               alice_engine_detect_platform_from_url(cfg->webhook));
+    target_path = cfg->target_path && cfg->target_path[0] ?
+                  cfg->target_path : TARGET_MIFI_PATH;
+    safe_copy(target_path_buf, sizeof(target_path_buf), target_path);
+    safe_copy(g_target_path, sizeof(g_target_path), target_path_buf);
+
+    if (cfg->num && cfg->num[0]) {
+        safe_copy(device_msisdn, sizeof(device_msisdn), cfg->num);
+    } else {
+        load_device_msisdn_from_nv_show();
+        if (!device_msisdn[0]) {
+            safe_copy(device_msisdn, sizeof(device_msisdn),
+                      "读取手机号失败 请使用 --num=参数进行手动添加");
+        }
+    }
+
+    threads_running = 1;
+    reset_strace_queue();
+    engine_log("[ENGINE] service mode starting");
+    engine_log("[ENGINE] target=%s strace=attached", g_target_path);
+    engine_log("[ENGINE] press Ctrl+C to stop");
+    signal(SIGINT, engine_signal_handler);
+    signal(SIGTERM, engine_signal_handler);
+
+    if (pthread_create(&strace_thread_id, NULL, strace_thread_func,
+                       g_target_path) != 0) {
+        engine_log("[ENGINE] failed to create strace thread errno=%d", errno);
+        return -1;
+    }
+    pdu_args[0] = (char *)cfg->webhook;
+    pdu_args[1] = (char *)platform;
+    pdu_args[2] = (char *)cfg->custom_ctype;
+    pdu_args[3] = (char *)cfg->custom_body;
+    pdu_args[4] = (char *)cfg->headtxt;
+    pdu_args[5] = (char *)cfg->tailtxt;
+    if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func,
+                       pdu_args) != 0) {
+        engine_log("[ENGINE] failed to create PDU thread errno=%d", errno);
+        threads_running = 0;
+        pthread_cond_broadcast(&g_strace_queue.cond);
+        pthread_join(strace_thread_id, NULL);
+        return -1;
+    }
+    pthread_join(strace_thread_id, NULL);
+    pthread_join(pdu_thread_id, NULL);
+    return 0;
+}
+
+int alice_engine_process_alive(pid_t pid) {
+    if (pid <= 0) return 0;
+    if (kill(pid, 0) == 0) return 1;
+    return errno == EPERM;
+}
+
+pid_t alice_engine_get_strace_pid(void) {
+    return get_strace_pid_from_file();
+}
+
+int alice_engine_find_process_by_exe_path(const char *exe_path) {
+    return find_process_by_exe_path(exe_path);
+}
+
+void alice_engine_cleanup_strace_child(const char *target_path) {
+    pid_t strace_pid = get_strace_pid_from_file();
+
+    if (strace_pid > 0 && alice_engine_process_alive(strace_pid)) {
+        kill(strace_pid, SIGTERM);
+        usleep(200 * 1000);
+        if (alice_engine_process_alive(strace_pid))
+            kill(strace_pid, SIGKILL);
+    }
+    if (target_path && target_path[0])
+        sigcont_process_by_path(target_path);
+    sigcont_process_by_path(g_target_path);
+    sigcont_process_by_path(TARGET_MIFI_PATH);
+    sigcont_process_by_path(TARGET_UFI_PATH);
+}
+
+void alice_engine_stop(void) {
+    threads_running = 0;
+    pthread_cond_broadcast(&g_strace_queue.cond);
+    alice_engine_cleanup_strace_child(g_target_path);
+}
+
+int alice_engine_load_device_msisdn(char *out, size_t outsz) {
+    load_device_msisdn_from_nv_show();
+    if (outsz) {
+        safe_copy(out, outsz, device_msisdn);
+    }
+    return device_msisdn[0] ? 0 : -1;
+}
+
+// strace线程函数 - 执行 strace 跟踪目标短信进程的 read/write 系统调用
+static void* strace_thread_func(void* arg) {
+    const char *target_path = (const char *)arg;
+    char local_target_path[256];
+
+    if (!target_path || !target_path[0])
+        target_path = TARGET_MIFI_PATH;
+    safe_copy(local_target_path, sizeof(local_target_path), target_path);
+    safe_copy(g_target_path, sizeof(g_target_path), local_target_path);
+    target_path = local_target_path;
 
     while (threads_running) {
-        int pid = find_zte_mifi_pid();
+        int pid = find_process_by_exe_path(target_path);
         if (pid <= 0) {
-            fprintf(stderr, "zte_mifi进程未找到\n");
+            engine_log("[ENGINE] target process not found: %s", target_path);
             sleep(1);
             continue;
         }
@@ -303,11 +457,12 @@ void* strace_thread_func(void* arg) {
         pid_t strace_pid = 0;
         int read_fd = -1;
         if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
-            perror("start_strace_with_pipe");
+            engine_log("[ENGINE] start_strace_with_pipe failed errno=%d", errno);
             sleep(1);
             continue;
         }
         set_strace_pid_to_file(strace_pid);
+        time_t next_midnight = get_next_midnight_epoch();
 
         char partial[MAX_BUFFER_LEN];
         size_t partial_len = 0;
@@ -345,6 +500,23 @@ void* strace_thread_func(void* arg) {
                 }
             }
 
+            time_t now = time(NULL);
+            if (now >= next_midnight) {
+                kill(strace_pid, SIGTERM);
+                int wait_count = 0;
+                while (wait_count < 10) {
+                    if (kill(strace_pid, 0) != 0) break;
+                    usleep(100*1000);
+                    wait_count++;
+                }
+                if (kill(strace_pid, 0) == 0) {
+                    kill(strace_pid, SIGKILL);
+                    usleep(200*1000);
+                }
+                sigcont_process_by_path(target_path);
+                break;
+            }
+
             int status = 0;
             pid_t w = waitpid(strace_pid, &status, WNOHANG);
             if (w == strace_pid) break;
@@ -359,16 +531,21 @@ void* strace_thread_func(void* arg) {
 }
 
 // PDU处理线程函数
-void* pdu_thread_func(void* arg) {
+static void* pdu_thread_func(void* arg) {
     char** args = (char**)arg;
     char* webhook = args[0];
-    char* headtxt = args[1];
-    char* tailtxt = args[2];
+    char* platform = args[1];
+    char* custom_ctype = args[2];
+    char* custom_body = args[3];
+    char* headtxt = args[4];
+    char* tailtxt = args[5];
 
     while (threads_running) {
         char line[MAX_BUFFER_LEN];
         if (strace_queue_pop_line(line, sizeof(line), 1000)) {
-            process_strace_line_for_sms(line, webhook, headtxt, tailtxt);
+            process_strace_line_for_sms(line, webhook, platform,
+                                        custom_ctype, custom_body,
+                                        headtxt, tailtxt);
         }
     }
     return NULL;
@@ -400,7 +577,7 @@ static sms_uniq_t sms_uniq_queue[SMS_UNIQ_QUEUE_SIZE];
 static int sms_uniq_head = 0;
 static int sms_uniq_count = 0;
 
-int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *text) {
+static int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *text) {
     int i;
     for (i = 0; i < sms_uniq_count; i++) {
         int idx = (sms_uniq_head + i) % SMS_UNIQ_QUEUE_SIZE;
@@ -412,7 +589,7 @@ int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *
     }
     return 0;
 }
-void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char *text) {
+static void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char *text) {
     int idx;
     if (sms_uniq_count < SMS_UNIQ_QUEUE_SIZE) {
         idx = (sms_uniq_head + sms_uniq_count) % SMS_UNIQ_QUEUE_SIZE;
@@ -433,8 +610,6 @@ void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char
         sms_uniq_head = (sms_uniq_head + 1) % SMS_UNIQ_QUEUE_SIZE;
     }
 }
-
-static char device_msisdn[64] = "";
 
 static void load_device_msisdn_from_nv_show(void) {
     device_msisdn[0] = 0;
@@ -462,7 +637,7 @@ static void load_device_msisdn_from_nv_show(void) {
 }
 
 // 完整的PDU解码，包含SMSC、发件人、时间戳等信息
-void decode_pdu(const char *pdu, sms_info_t *info) {
+static void decode_pdu(const char *pdu, sms_info_t *info) {
     memset(info, 0, sizeof(*info));
     int idx = 0;
     int smsc_len = 0;
@@ -605,306 +780,327 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     free(ucs2_hex);
 }
 
-// JSON文本安全转义：将输入中的特殊字符转义后写入输出缓冲区
-static void json_escape(const char *src, char *dst, size_t dstsize) {
-    size_t i = 0, j = 0;
-    while (src[i] && j + 2 < dstsize) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '"')      { dst[j++] = '\\'; dst[j++] = '"'; }
-        else if (c == '\\') { dst[j++] = '\\'; dst[j++] = '\\'; }
-        else if (c == '\n') { dst[j++] = '\\'; dst[j++] = 'n'; }
-        else if (c == '\r') { dst[j++] = '\\'; dst[j++] = 'n'; }
-        else if (c == '\t') { dst[j++] = ' '; }
-        else if (c >= 0x20) { dst[j++] = c; }
-        i++;
+static void form_url_escape(char *out, size_t outsz, const char *in) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t used = 0;
+
+    if (!outsz) return;
+    if (!in) in = "";
+    while (*in && used + 1 < outsz) {
+        unsigned char c = (unsigned char)*in++;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            out[used++] = (char)c;
+        } else if (used + 3 < outsz) {
+            out[used++] = '%';
+            out[used++] = hex[c >> 4];
+            out[used++] = hex[c & 0x0f];
+        } else {
+            break;
+        }
     }
-    dst[j] = 0;
+    out[used] = 0;
 }
 
-// 通过 mbedtls 发送 HTTPS POST 请求。tag 用于调试日志标识
-static void ssl_http_post(const char *host, const char *path, const char *json_body, const char *tag) {
+static int replace_token(char *out, size_t outsz, const char *token,
+                         const char *value) {
+    size_t tlen = strlen(token);
+    size_t vlen = strlen(value ? value : "");
+    char *p = strstr(out, token);
+    size_t tail_len;
+
+    while (p) {
+        tail_len = strlen(p + tlen);
+        if ((size_t)(p - out) + vlen + tail_len >= outsz)
+            return -1;
+        memmove(p + vlen, p + tlen, tail_len + 1);
+        memcpy(p, value ? value : "", vlen);
+        p = strstr(p + vlen, token);
+    }
+    return 0;
+}
+
+static int render_custom_body(const char *tmpl, const char *txt,
+                              char *out, size_t outsz) {
+    char json_txt[3072];
+    char url_txt[3072];
+
+    if (!tmpl || !tmpl[0] || !outsz)
+        return -1;
+    safe_copy(out, outsz, tmpl);
+    json_escape(json_txt, sizeof(json_txt), txt);
+    form_url_escape(url_txt, sizeof(url_txt), txt);
+    if (replace_token(out, outsz, "{{json_text}}", json_txt) < 0)
+        return -1;
+    if (replace_token(out, outsz, "{{url_text}}", url_txt) < 0)
+        return -1;
+    if (replace_token(out, outsz, "{{text}}", txt ? txt : "") < 0)
+        return -1;
+    return 0;
+}
+
+static int extract_bark_device_key(const char *url, char *out, size_t outsz) {
+    const char *p;
+    const char *end;
+    size_t len;
+
+    if (!url || !out || outsz == 0)
+        return -1;
+    out[0] = 0;
+    p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    p = strchr(p, '/');
+    if (!p || !p[1])
+        return -1;
+    p++;
+    if (strncmp(p, "push", 4) == 0 &&
+        (p[4] == 0 || p[4] == '?' || p[4] == '/' || p[4] == '#'))
+        return -1;
+    end = p;
+    while (*end && *end != '/' && *end != '?' && *end != '#')
+        end++;
+    len = (size_t)(end - p);
+    if (len == 0 || len >= outsz)
+        return -1;
+    memcpy(out, p, len);
+    out[len] = 0;
+    return 0;
+}
+
+int alice_engine_build_webhook_payload(const char *webhook, const char *platform,
+                                 const char *txt,
+                                 const char *custom_ctype,
+                                 const char *custom_body,
+                                 char *payload, size_t payload_sz,
+                                 char *ctype, size_t ctype_sz) {
+    char safe_txt[3072];
+    char safe_key[512];
+    char enc_txt[3072];
+    const char *p = platform && platform[0] ? platform : "dingtalk";
+
+    if (!payload_sz || !ctype_sz)
+        return -1;
+    payload[0] = 0;
+    ctype[0] = 0;
+
+    if (strcmp(p, "serverchan") == 0) {
+        form_url_escape(enc_txt, sizeof(enc_txt), txt);
+        snprintf(ctype, ctype_sz, "application/x-www-form-urlencoded");
+        snprintf(payload, payload_sz, "title=Alice%%20Pusher&desp=%s", enc_txt);
+        return payload[0] ? 0 : -1;
+    }
+    if (strcmp(p, "telegram") == 0) {
+        form_url_escape(enc_txt, sizeof(enc_txt), txt);
+        snprintf(ctype, ctype_sz, "application/x-www-form-urlencoded");
+        snprintf(payload, payload_sz, "text=%s", enc_txt);
+        return payload[0] ? 0 : -1;
+    }
+    if (strcmp(p, "custom") == 0) {
+        const char *tmpl = custom_body && custom_body[0] ? custom_body :
+                           "{\"text\":\"{{json_text}}\"}";
+        snprintf(ctype, ctype_sz, "%s",
+                 custom_ctype && custom_ctype[0] ? custom_ctype :
+                 "application/json;charset=utf-8");
+        if (render_custom_body(tmpl, txt, payload, payload_sz) < 0)
+            return -1;
+        return payload[0] ? 0 : -1;
+    }
+
+    json_escape(safe_txt, sizeof(safe_txt), txt);
+    snprintf(ctype, ctype_sz, "application/json;charset=utf-8");
+    if (strcmp(p, "feishu") == 0) {
+        snprintf(payload, payload_sz,
+                 "{\"msg_type\":\"text\",\"content\":{\"text\":\"%s\"}}",
+                 safe_txt);
+    } else if (strcmp(p, "discord") == 0) {
+        snprintf(payload, payload_sz,
+                 "{\"content\":\"%s\"}",
+                 safe_txt);
+    } else if (strcmp(p, "bark") == 0) {
+        char bark_key[256];
+        if (extract_bark_device_key(webhook, bark_key, sizeof(bark_key)) < 0)
+            return -1;
+        json_escape(safe_key, sizeof(safe_key), bark_key);
+        snprintf(payload, payload_sz,
+                 "{\"title\":\"Alice Pusher\",\"body\":\"%s\",\"device_key\":\"%s\"}",
+                 safe_txt, safe_key);
+    } else {
+        snprintf(payload, payload_sz,
+                 "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}",
+                 safe_txt);
+    }
+    return payload[0] ? 0 : -1;
+}
+
+static int post_https_body(const char *webhook, const char *ctype,
+                           const char *payload, const char *platform) {
+    char *host = NULL, *path = NULL;
+    const char *request_path;
+    char request_buffer[8192];
+    unsigned char read_buf[1024];
+    int request_len;
     int ret = 0;
+    int rc = -1;
+    const char *port = "443";
+    const char *pers = "ssl_client";
     mbedtls_net_context server_fd;
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
-    const char *port = "443";
+
+    parse_url(webhook, &host, &path);
+    if (!host || !path) {
+        engine_log("[WEBHOOK] invalid url");
+        goto cleanup_strings;
+    }
+    request_path = path;
+    if (platform && strcmp(platform, "bark") == 0)
+        request_path = "/push";
+
     mbedtls_net_init(&server_fd);
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
-    const char *pers = "ssl_client";
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) return;
-    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) return;
-    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) return;
+
+    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
+                                     &entropy, (const unsigned char *)pers,
+                                     strlen(pers))) != 0) {
+        print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
+        goto cleanup_tls;
+    }
+    if ((ret = mbedtls_net_connect(&server_fd, host, port,
+                                   MBEDTLS_NET_PROTO_TCP)) != 0) {
+        print_mbedtls_error(ret, "mbedtls_net_connect");
+        goto cleanup_tls;
+    }
+    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
+        goto cleanup_tls;
+    }
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) return;
-    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
+        print_mbedtls_error(ret, "mbedtls_ssl_setup");
+        goto cleanup_tls;
+    }
+    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send,
+                        mbedtls_net_recv, NULL);
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) return;
-    }
-    char request_buffer[8192];
-    snprintf(request_buffer, sizeof(request_buffer),
-             "POST %s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Content-Type: application/json;charset=utf-8\r\n"
-             "Content-Length: %zu\r\n"
-             "\r\n"
-             "%s",
-             path, host, strlen(json_body), json_body);
-    printf("[DEBUG] %s HTTP Request:\n%s\n", tag, request_buffer);
-    while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) return;
-    }
-    unsigned char buf[1024];
-    memset(buf, 0, sizeof(buf));
-    ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-    if (ret > 0) printf("[%s] %s\n", tag, buf);
-    mbedtls_net_free(&server_fd);
-    mbedtls_ssl_free(&ssl);
-    mbedtls_ssl_config_free(&conf);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
-}
-
-// 发送企业微信消息接口（只支持text）
-void send_wecom_msg(const char *webhook, const char *txt) {
-    char safe[2048], json_msg[4096];
-    char *host = NULL, *path = NULL;
-    json_escape(txt, safe, sizeof(safe));
-    snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", safe);
-    parse_url(webhook, &host, &path);
-    if (!host || !path) { if (host) free(host); if (path) free(path); return; }
-    ssl_http_post(host, path, json_msg, "WECOM");
-    free(host); free(path);
-}
-
-// 发送钉钉消息接口（只支持text）
-void send_dingtalk_msg(const char *webhook, const char *txt) {
-    char safe[2048], json_msg[4096];
-    char *host = NULL, *path = NULL;
-    json_escape(txt, safe, sizeof(safe));
-    snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", safe);
-    parse_url(webhook, &host, &path);
-    if (!host || !path) { if (host) free(host); if (path) free(path); return; }
-    ssl_http_post(host, path, json_msg, "DINGTALK");
-    free(host); free(path);
-}
-
-// 解析 Bark URL，提取 host 和 key。返回值: 1=HTTPS, 0=HTTP, -1=错误
-static int parse_bark_url(const char *url, char **host, char **bark_key) {
-    const char *start;
-    int use_ssl = 0;
-
-    if (strstr(url, "https://") == url) {
-        start = url + strlen("https://");
-        use_ssl = 1;
-    } else if (strstr(url, "http://") == url) {
-        start = url + strlen("http://");
-    } else {
-        *host = NULL;
-        *bark_key = NULL;
-        return -1;
-    }
-
-    const char *slash = strchr(start, '/');
-    if (!slash) {
-        *host = NULL;
-        *bark_key = NULL;
-        return -1;
-    }
-
-    size_t host_len = (size_t)(slash - start);
-    *host = (char *)malloc(host_len + 1);
-    memcpy(*host, start, host_len);
-    (*host)[host_len] = '\0';
-
-    const char *key_start = slash + 1;
-    while (*key_start == '/') key_start++;
-    const char *key_end = strchr(key_start, '/');
-    if (key_end && key_end > key_start) {
-        size_t key_len = (size_t)(key_end - key_start);
-        *bark_key = (char *)malloc(key_len + 1);
-        memcpy(*bark_key, key_start, key_len);
-        (*bark_key)[key_len] = '\0';
-    } else {
-        *bark_key = strdup(key_start);
-    }
-
-    return use_ssl;
-}
-
-// 发送 Bark 推送消息（支持 HTTP/HTTPS）
-void send_bark_msg(const char *webhook, const char *txt) {
-    char *host = NULL, *bark_key = NULL;
-    int use_ssl = parse_bark_url(webhook, &host, &bark_key);
-    if (!host || !bark_key) {
-        if (host) free(host);
-        if (bark_key) free(bark_key);
-        fprintf(stderr, "[BARK] Invalid URL format\n");
-        return;
-    }
-
-    char title[256];
-    char body[2048];
-    const char *newline = strchr(txt, '\n');
-    if (newline && newline > txt) {
-        size_t title_len = (size_t)(newline - txt);
-        if (title_len >= sizeof(title)) title_len = sizeof(title) - 1;
-        memcpy(title, txt, title_len);
-        title[title_len] = '\0';
-        snprintf(body, sizeof(body), "%s", newline + 1);
-    } else {
-        snprintf(title, sizeof(title), "短信通知");
-        snprintf(body, sizeof(body), "%s", txt);
-    }
-
-    char safe_body[4096];
-    json_escape(body, safe_body, sizeof(safe_body));
-
-    char safe_title[512];
-    json_escape(title, safe_title, sizeof(safe_title));
-
-    char json_msg[8192];
-    snprintf(json_msg, sizeof(json_msg),
-        "{\"title\":\"%s\",\"body\":\"%s\",\"group\":\"SMS\"}",
-        safe_title, safe_body);
-
-    char path_buf[512];
-    snprintf(path_buf, sizeof(path_buf), "/%s", bark_key);
-
-    const char *port = use_ssl ? "443" : "80";
-
-    int ret = 0;
-    mbedtls_net_context server_fd;
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
-
-    mbedtls_net_init(&server_fd);
-    mbedtls_ssl_init(&ssl);
-    mbedtls_ssl_config_init(&conf);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    const char *pers = "ssl_client";
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-        goto bark_cleanup;
-    }
-
-    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-        fprintf(stderr, "[BARK] net_connect failed: -0x%x\n", -ret);
-        goto bark_cleanup;
-    }
-
-    if (use_ssl) {
-        if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-            goto bark_cleanup;
-        }
-        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-        if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-            goto bark_cleanup;
-        }
-        mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-        while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                goto bark_cleanup;
-            }
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            print_mbedtls_error(ret, "mbedtls_ssl_handshake");
+            goto cleanup_tls;
         }
     }
 
-    char request_buffer[8192];
-    snprintf(request_buffer, sizeof(request_buffer),
+    request_len = snprintf(request_buffer, sizeof(request_buffer),
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "Content-Type: application/json;charset=utf-8\r\n"
+        "User-Agent: alice-pusher-bot/1.0\r\n"
+        "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
         "\r\n"
         "%s",
-        path_buf, host, strlen(json_msg), json_msg);
+        request_path, host, ctype, strlen(payload), payload);
+    if (request_len <= 0 || request_len >= (int)sizeof(request_buffer)) {
+        engine_log("[WEBHOOK] request too large");
+        goto cleanup_tls;
+    }
 
-    printf("[DEBUG] Bark HTTP Request:\n%s\n", request_buffer);
-
-    if (use_ssl) {
-        while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                goto bark_cleanup;
-            }
+    engine_log("[WEBHOOK] platform=%s host=%s bytes=%zu",
+               platform ? platform : "dingtalk", host, strlen(payload));
+    while ((ret = mbedtls_ssl_write(&ssl,
+                                    (const unsigned char *)request_buffer,
+                                    (size_t)request_len)) <= 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            print_mbedtls_error(ret, "mbedtls_ssl_write");
+            goto cleanup_tls;
         }
-    } else {
-        ret = mbedtls_net_send(&server_fd, (const unsigned char *)request_buffer, strlen(request_buffer));
-        if (ret <= 0) {
-            fprintf(stderr, "[BARK] send failed: %d\n", ret);
-            goto bark_cleanup;
-        }
     }
 
-    unsigned char buf[1024];
-    memset(buf, 0, sizeof(buf));
-    if (use_ssl) {
-        ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-    } else {
-        ret = mbedtls_net_recv(&server_fd, buf, sizeof(buf) - 1);
-    }
-    if (ret > 0) {
-        printf("[BARK] %s\n", buf);
-    }
+    memset(read_buf, 0, sizeof(read_buf));
+    ret = mbedtls_ssl_read(&ssl, read_buf, sizeof(read_buf) - 1);
+    if (ret > 0)
+        engine_log("[WEBHOOK] response: %s", read_buf);
+    else if (ret < 0 &&
+             ret != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY &&
+             ret != MBEDTLS_ERR_SSL_WANT_READ)
+        print_mbedtls_error(ret, "mbedtls_ssl_read");
+    rc = 0;
 
-bark_cleanup:
-    if (host) free(host);
-    if (bark_key) free(bark_key);
+cleanup_tls:
     mbedtls_net_free(&server_fd);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
+cleanup_strings:
+    if (host) free(host);
+    if (path) free(path);
+    return rc;
 }
 
-// 发送飞书消息接口（只支持text）
-void send_feishu_msg(const char *webhook, const char *txt) {
-    char safe[2048], json_msg[4096];
-    char *host = NULL, *path = NULL;
-    json_escape(txt, safe, sizeof(safe));
-    snprintf(json_msg, sizeof(json_msg), "{\"msg_type\":\"text\",\"content\":{\"text\":\"%s\"}}", safe);
-    parse_url(webhook, &host, &path);
-    if (!host || !path) { if (host) free(host); if (path) free(path); return; }
-    ssl_http_post(host, path, json_msg, "FEISHU");
-    free(host); free(path);
+int alice_engine_send_webhook_msg(const char *webhook, const char *platform,
+                                  const char *txt, const char *custom_ctype,
+                                  const char *custom_body) {
+    char payload[4096];
+    char ctype[160];
+    const char *p = platform && platform[0] ? platform : "dingtalk";
+
+    if (!webhook || !webhook[0] || !txt)
+        return -1;
+    if (alice_engine_build_webhook_payload(webhook, p, txt, custom_ctype, custom_body,
+                              payload, sizeof(payload),
+                              ctype, sizeof(ctype)) < 0)
+        return -1;
+    return post_https_body(webhook, ctype, payload, p);
 }
 
-// 自动检测平台并发送消息的统一入口
-void send_webhook_msg(const char *webhook, const char *txt) {
-    webhook_platform_t platform = detect_platform(webhook);
-    switch (platform) {
-        case PLATFORM_WECOM:
-            printf("[INFO] 检测到企业微信平台, 使用企业微信规则推送\n");
-            send_wecom_msg(webhook, txt);
-            break;
-        case PLATFORM_DINGTALK:
-            printf("[INFO] 检测到钉钉平台, 使用钉钉规则推送\n");
-            send_dingtalk_msg(webhook, txt);
-            break;
-        case PLATFORM_BARK:
-            printf("[INFO] 检测到Bark平台, 使用Bark规则推送\n");
-            send_bark_msg(webhook, txt);
-            break;
-        case PLATFORM_FEISHU:
-            printf("[INFO] 检测到飞书平台, 使用飞书规则推送\n");
-            send_feishu_msg(webhook, txt);
-            break;
-        default:
-            printf("[INFO] 未匹配已知平台, 使用通用webhook格式尝试推送\n");
-            send_dingtalk_msg(webhook, txt);
-            break;
+static void append_message_text(char *out, size_t outsz, const char *text) {
+    size_t used;
+    size_t left;
+
+    if (!out || outsz == 0 || !text || !text[0])
+        return;
+    used = strlen(out);
+    if (used >= outsz - 1)
+        return;
+    left = outsz - used - 1;
+    strncat(out, text, left);
+}
+
+void alice_engine_build_push_message(char *out, size_t outsz,
+                               const char *headtxt,
+                               const char *body,
+                               const char *tailtxt) {
+    if (!out || outsz == 0)
+        return;
+    out[0] = 0;
+    if (headtxt && headtxt[0]) {
+        append_message_text(out, outsz, headtxt);
+        append_message_text(out, outsz, "\n");
+    }
+    append_message_text(out, outsz, body);
+    if (tailtxt && tailtxt[0]) {
+        if (out[0])
+            append_message_text(out, outsz, "\n");
+        append_message_text(out, outsz, tailtxt);
     }
 }
 
-static void process_strace_line_for_sms(const char *line, const char *webhook, const char *headtxt, const char *tailtxt) {
+static void process_strace_line_for_sms(const char *line, const char *webhook,
+                                        const char *platform,
+                                        const char *custom_ctype,
+                                        const char *custom_body,
+                                        const char *headtxt,
+                                        const char *tailtxt) {
     char local[MAX_BUFFER_LEN];
     strncpy(local, line, sizeof(local) - 1);
     local[sizeof(local) - 1] = 0;
@@ -912,12 +1108,9 @@ static void process_strace_line_for_sms(const char *line, const char *webhook, c
     char *p = strstr(local, "+CMT: ");
     if (p) {
         char *first_crlf = strstr(p, "\\r\\n");
-        printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-local) : -1L);
         if (first_crlf) {
             char *pdu_start = first_crlf + 4;
-            printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-local));
             char *pdu_end = strstr(pdu_start, "\\r\\n");
-            if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-local));
             char pdu[2048] = "";
             if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
                 strncpy(pdu, pdu_start, pdu_end - pdu_start);
@@ -926,15 +1119,16 @@ static void process_strace_line_for_sms(const char *line, const char *webhook, c
                 strncpy(pdu, pdu_start, sizeof(pdu)-1);
                 pdu[sizeof(pdu)-1] = 0;
             }
-            printf("[DEBUG] pdu_raw: %s\n", pdu);
-            printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
             char *pdubegin = pdu;
             while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
             char *pdu_trim = pdubegin;
-            char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
-            while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
-            printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
-            printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
+            size_t trim_len = strlen(pdu_trim);
+            if (trim_len > 0) {
+                char *pdutail = pdu_trim + trim_len - 1;
+                while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) {
+                    *pdutail-- = 0;
+                }
+            }
             if (pdu_trim[0]) {
                 int valid_pdu = 1;
                 size_t pdu_len = strlen(pdu_trim);
@@ -950,53 +1144,43 @@ static void process_strace_line_for_sms(const char *line, const char *webhook, c
                 if (valid_pdu) {
                     sms_info_t info;
                     decode_pdu(pdu_trim, &info);
-                    printf("[DEBUG] sms_decoded: %s\n", info.text);
-                    printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
                     size_t textlen = strlen(info.text);
                     if (textlen > 0) {
                         if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
                             add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
-                            char msg[1536];
+                            char msg[1024];
+                            char final_msg[2048];
                             snprintf(msg, sizeof(msg),
-                                "%s%s"
-                                "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s"
-                                "%s%s",
-                                headtxt ? headtxt : "", headtxt ? "\n" : "",
+                                "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
                                 device_msisdn[0] ? device_msisdn : "N/A",
                                 info.smsc[0] ? info.smsc : "N/A",
                                 info.sender[0] ? info.sender : "N/A",
                                 info.timestamp[0] ? info.timestamp : "N/A",
-                                info.text,
-                                tailtxt ? "\n" : "", tailtxt ? tailtxt : "");
-                            send_webhook_msg(webhook, msg);
-                        } else {
-                            printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
+                                info.text);
+                            alice_engine_build_push_message(final_msg, sizeof(final_msg),
+                                               headtxt, msg, tailtxt);
+                            alice_engine_send_webhook_msg(webhook, platform, final_msg,
+                                             custom_ctype, custom_body);
                         }
                     }
-                } else {
-                    printf("[DEBUG] skip invalid pdu: %s\n", pdu_trim);
                 }
             }
-        } else {
-            printf("[DEBUG] first_crlf not found after +CMT:\n");
         }
     }
 }
 
 // 打印 mbedtls 错误码的帮助函数
-void print_mbedtls_error(int ret, const char *msg) {
-    fprintf(stderr, "%s failed: -0x%x\n", msg, -ret);
+static void print_mbedtls_error(int ret, const char *msg) {
+    engine_log("[TLS] %s failed: -0x%x", msg, -ret);
 }
 
 // 从 URL 中提取主机名和路径
-void parse_url(const char *url, char **host, char **path) {
+static void parse_url(const char *url, char **host, char **path) {
     char *start;
     char *end;
 
     if (strstr(url, "https://") == url) {
         start = (char *)url + strlen("https://");
-    } else if (strstr(url, "http://") == url) {
-        start = (char *)url + strlen("http://");
     } else {
         *host = NULL;
         *path = NULL;
@@ -1016,7 +1200,8 @@ void parse_url(const char *url, char **host, char **path) {
 }
 
 // 信号处理函数，用于优雅关闭线程
-void signal_handler(int sig) {
+static void engine_signal_handler(int sig) {
+    (void)sig;
     threads_running = 0;
     
     // 给线程一些时间来清理
@@ -1031,289 +1216,9 @@ void signal_handler(int sig) {
             kill(strace_pid, SIGKILL);
         }
     }
+    sigcont_process_by_path(g_target_path);
+    sigcont_process_by_path(TARGET_MIFI_PATH);
+    sigcont_process_by_path(TARGET_UFI_PATH);
     
     exit(0);
-}
-
-int main(int argc, char *argv[]) {
-    int only_service_mode = 0;
-    int only_strace_mode = 0;
-    int only_rerun_mode = 0;
-    int only_send_once_mode = 0; // 新增
-    char *headtxt = NULL, *tailtxt = NULL;
-    char *manual_msisdn = NULL;
-    int i;
-    for (i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--mode=strace_zte_mifi") == 0)) {
-            only_strace_mode = 1;
-        }
-        if ((strcmp(argv[i], "--mode=re-run-strace_zte_mifi") == 0)) {
-            only_rerun_mode = 1;
-        }
-        if ((strcmp(argv[i], "--mode=service_start") == 0)) {
-            only_service_mode = 1;
-        }
-        if ((strcmp(argv[i], "--mode=send_once") == 0)) { // 新增
-            only_send_once_mode = 1;
-        }
-        if (strncmp(argv[i], "--headtxt=", 10) == 0) {
-            headtxt = argv[i] + 10;
-        }
-        if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
-            tailtxt = argv[i] + 10;
-        }
-        if (strncmp(argv[i], "--num=", 6) == 0) {
-            manual_msisdn = argv[i] + 6;
-        }
-    }
-    if (only_strace_mode && argc == 2) {
-        trace_zte_mifi();
-        return 0;
-    }
-    if (only_rerun_mode && argc == 2) {
-        rerun_strace_zte_mifi();
-        return 0;
-    }
-    if (only_service_mode) {
-        char *webhook = NULL;
-        for (i = 1; i < argc; i++) {
-            if (strncmp(argv[i], "--url=", 6) == 0) {
-                webhook = argv[i] + 6;
-            }
-        }
-        if (!webhook || strlen(webhook) == 0) {
-            fprintf(stderr, "Error: --mode=service_start 时必须指定 --url=<webhook_url> 参数！\n");
-            return 1;
-        }
-        if (manual_msisdn && manual_msisdn[0]) {
-            strncpy(device_msisdn, manual_msisdn, sizeof(device_msisdn) - 1);
-            device_msisdn[sizeof(device_msisdn) - 1] = 0;
-        } else {
-            load_device_msisdn_from_nv_show();
-            if (!device_msisdn[0]) {
-                strncpy(device_msisdn, "读取手机号失败 请使用 --num=参数进行手动添加", sizeof(device_msisdn) - 1);
-                device_msisdn[sizeof(device_msisdn) - 1] = 0;
-            }
-        }
-        printf("Alice Pushbot - Service mode starting.\n");
-        printf("Target: /sbin/zte_mifi or zte_ufi (strace attached).\n");
-        printf("Press Ctrl+C to stop.\n");
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-        if (pthread_create(&strace_thread_id, NULL, strace_thread_func, webhook) != 0) {
-            perror("Failed to create strace thread");
-            return 1;
-        }
-        char* pdu_args[3] = {webhook, headtxt, tailtxt};
-        if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func, pdu_args) != 0) {
-            perror("Failed to create PDU thread");
-            return 1;
-        }
-        pthread_join(strace_thread_id, NULL);
-        pthread_join(pdu_thread_id, NULL);
-        return 0;
-    }
-    if (only_send_once_mode) {
-        char *url = NULL, *msgtype = NULL, *txt = NULL;
-        for (i = 1; i < argc; i++) {
-            if (strncmp(argv[i], "--url=", 6) == 0) {
-                url = argv[i] + 6;
-            } else if (strncmp(argv[i], "--msgtype=", 10) == 0) {
-                msgtype = argv[i] + 10;
-            } else if (strncmp(argv[i], "--txt=", 6) == 0) {
-                txt = argv[i] + 6;
-            }
-        }
-        if (!url || !msgtype || !txt) {
-            fprintf(stderr, "Usage: %s --mode=send_once --url=<webhook_url> --msgtype=text --txt=<content>\n", argv[0]);
-            return 1;
-        }
-        char *host = NULL, *path = NULL;
-        parse_url(url, &host, &path);
-        if (!host || !path) {
-            fprintf(stderr, "Invalid webhook URL format.\n");
-            if (host) free(host);
-            if (path) free(path);
-            return 1;
-        }
-        char data[MAX_BUFFER_LEN];
-        if (strcmp(msgtype, "text") == 0) {
-            snprintf(data, sizeof(data), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", txt);
-        } else {
-            fprintf(stderr, "Only msgtype=text is supported.\n");
-            free(host); free(path);
-            return 1;
-        }
-        int ret = 0;
-        mbedtls_net_context server_fd;
-        mbedtls_ssl_context ssl;
-        mbedtls_ssl_config conf;
-        mbedtls_entropy_context entropy;
-        mbedtls_ctr_drbg_context ctr_drbg;
-        const char *port = "443";
-        mbedtls_net_init(&server_fd);
-        mbedtls_ssl_init(&ssl);
-        mbedtls_ssl_config_init(&conf);
-        mbedtls_entropy_init(&entropy);
-        mbedtls_ctr_drbg_init(&ctr_drbg);
-        const char *pers = "ssl_client";
-        if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-            print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
-            goto cleanup_once;
-        }
-        if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-            print_mbedtls_error(ret, "mbedtls_net_connect");
-            goto cleanup_once;
-        }
-        if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-            print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
-            goto cleanup_once;
-        }
-        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-        if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-            print_mbedtls_error(ret, "mbedtls_ssl_setup");
-            goto cleanup_once;
-        }
-        mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-        while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                print_mbedtls_error(ret, "mbedtls_ssl_handshake");
-                goto cleanup_once;
-            }
-        }
-        char request_buffer[MAX_BUFFER_LEN];
-        snprintf(request_buffer, sizeof(request_buffer),
-                 "POST %s HTTP/1.1\r\n"
-                 "Host: %s\r\n"
-                 "Content-Type: application/json;charset=utf-8\r\n"
-                 "Content-Length: %zu\r\n"
-                 "\r\n"
-                 "%s",
-                 path, host, strlen(data), data);
-        while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                print_mbedtls_error(ret, "mbedtls_ssl_write");
-                goto cleanup_once;
-            }
-        }
-        unsigned char buf[1024];
-        memset(buf, 0, sizeof(buf));
-        ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-        if (ret > 0) {
-            printf("%s\n", buf);
-        } else if (ret < 0) {
-            print_mbedtls_error(ret, "mbedtls_ssl_read");
-        }
-    cleanup_once:
-        if (host) free(host);
-        if (path) free(path);
-        mbedtls_net_free(&server_fd);
-        mbedtls_ssl_free(&ssl);
-        mbedtls_ssl_config_free(&conf);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
-        return ret;
-    }
-    // 保持原有兼容模式
-    char *url = NULL, *msgtype = NULL, *txt = NULL;
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--url=", 6) == 0) {
-            url = argv[i] + 6;
-        } else if (strncmp(argv[i], "--msgtype=", 10) == 0) {
-            msgtype = argv[i] + 10;
-        } else if (strncmp(argv[i], "--txt=", 6) == 0) {
-            txt = argv[i] + 6;
-        }
-    }
-    if (!url || !msgtype || !txt) {
-        fprintf(stderr, "Usage: %s --url=<webhook_url> --msgtype=text --txt=<content>\n", argv[0]);
-        return 1;
-    }
-    char *host = NULL, *path = NULL;
-    parse_url(url, &host, &path);
-    if (!host || !path) {
-        fprintf(stderr, "Invalid webhook URL format.\n");
-        if (host) free(host);
-        if (path) free(path);
-        return 1;
-    }
-    char data[MAX_BUFFER_LEN];
-    if (strcmp(msgtype, "text") == 0) {
-        snprintf(data, sizeof(data), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", txt);
-    } else {
-        fprintf(stderr, "Only msgtype=text is supported.\n");
-        free(host); free(path);
-        return 1;
-    }
-    int ret = 0;
-    mbedtls_net_context server_fd;
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    const char *port = "443";
-    mbedtls_net_init(&server_fd);
-    mbedtls_ssl_init(&ssl);
-    mbedtls_ssl_config_init(&conf);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-    const char *pers = "ssl_client";
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
-        goto cleanup;
-    }
-    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_net_connect");
-        goto cleanup;
-    }
-    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
-        goto cleanup;
-    }
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_setup");
-        goto cleanup;
-    }
-    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "mbedtls_ssl_handshake");
-            goto cleanup;
-        }
-    }
-    char request_buffer[MAX_BUFFER_LEN];
-    snprintf(request_buffer, sizeof(request_buffer),
-             "POST %s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Content-Type: application/json;charset=utf-8\r\n"
-             "Content-Length: %zu\r\n"
-             "\r\n"
-             "%s",
-             path, host, strlen(data), data);
-    while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "mbedtls_ssl_write");
-            goto cleanup;
-        }
-    }
-    unsigned char buf[1024];
-    memset(buf, 0, sizeof(buf));
-    ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-    if (ret > 0) {
-        printf("%s\n", buf);
-    } else if (ret < 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_read");
-    }
-cleanup:
-    if (host) free(host);
-    if (path) free(path);
-    mbedtls_net_free(&server_fd);
-    mbedtls_ssl_free(&ssl);
-    mbedtls_ssl_config_free(&conf);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
-    return ret;
 }

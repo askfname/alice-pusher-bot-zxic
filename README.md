@@ -43,6 +43,14 @@
 
 ---
 
+## 源码结构
+
+- `src/webui.c`：WebUI、配置、自启动、服务管理和 CLI 入口。
+- `src/alice-pusher-bot.c`：PDU 解码、strace 跟踪和 Webhook 推送引擎核心。
+- `src/alice-pusher-bot.h`：WebUI 调用引擎核心的公共接口。
+
+---
+
 ## 注意事项
 
 - 请确保您的系统环境满足依赖要求。
