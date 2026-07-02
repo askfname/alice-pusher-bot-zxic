@@ -21,14 +21,40 @@
 
 #define MAX_BUFFER_LEN 4096
 
+// 平台类型枚举
+typedef enum {
+    PLATFORM_WECOM,     // 企业微信
+    PLATFORM_DINGTALK,  // 钉钉
+    PLATFORM_BARK,      // Bark (iOS推送)
+    PLATFORM_FEISHU,    // 飞书
+    PLATFORM_UNKNOWN    // 未知平台
+} webhook_platform_t;
+
+// 通过URL特征自动检测平台类型
+static webhook_platform_t detect_platform(const char *url) {
+    if (strstr(url, "qyapi.weixin.qq.com")) {
+        return PLATFORM_WECOM;
+    }
+    if (strstr(url, "oapi.dingtalk.com")) {
+        return PLATFORM_DINGTALK;
+    }
+    if (strstr(url, "api.day.app")) {
+        return PLATFORM_BARK;
+    }
+    if (strstr(url, "open.feishu.cn") || strstr(url, "open.larkoffice.com")) {
+        return PLATFORM_FEISHU;
+    }
+    return PLATFORM_UNKNOWN;
+}
 
 // 函数声明
 static pid_t get_strace_pid_from_file(void);
 static void set_strace_pid_to_file(pid_t pid);
-void extract_write_lines_from_log(void);
-void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen);
 void send_dingtalk_msg(const char *webhook, const char *txt);
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt);
+void send_wecom_msg(const char *webhook, const char *txt);
+void send_bark_msg(const char *webhook, const char *txt);
+void send_feishu_msg(const char *webhook, const char *txt);
+void send_webhook_msg(const char *webhook, const char *txt);
 void print_mbedtls_error(int ret, const char *msg);
 void parse_url(const char *url, char **host, char **path);
 void signal_handler(int sig);
@@ -103,18 +129,6 @@ static int strace_queue_pop_line(char *out, size_t outlen, int timeout_ms) {
     return 1;
 }
 
-static time_t get_next_midnight_epoch(void) {
-    time_t now = time(NULL);
-    struct tm *tm_now_ptr = localtime(&now);
-    if (!tm_now_ptr) return now + 24 * 3600;
-    struct tm tm_now = *tm_now_ptr;
-    tm_now.tm_hour = 0;
-    tm_now.tm_min = 0;
-    tm_now.tm_sec = 0;
-    time_t today_midnight = mktime(&tm_now);
-    return today_midnight + 24 * 3600;
-}
-
 static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *out_read_fd) {
     int fds[2];
     if (pipe(fds) != 0) return -1;
@@ -127,6 +141,7 @@ static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *ou
 
         char pidstr[16];
         snprintf(pidstr, sizeof(pidstr), "%d", target_pid);
+        execl("/tmp/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, (char*)NULL);
         execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, (char*)NULL);
         _exit(127);
     }
@@ -153,77 +168,55 @@ void trace_zte_mifi() {
         fprintf(stderr, "zte_mifi进程未找到\n");
         return;
     }
-    while (1) {
-        pid_t strace_pid = 0;
-        int read_fd = -1;
-        if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
-            perror("start_strace_with_pipe");
-            return;
-        }
-        set_strace_pid_to_file(strace_pid);
-        time_t next_midnight = get_next_midnight_epoch();
-
-        char partial[MAX_BUFFER_LEN];
-        size_t partial_len = 0;
-        while (1) {
-            struct pollfd pfd;
-            memset(&pfd, 0, sizeof(pfd));
-            pfd.fd = read_fd;
-            pfd.events = POLLIN;
-            int pr = poll(&pfd, 1, 500);
-            if (pr > 0 && (pfd.revents & POLLIN)) {
-                char buf[1024];
-                ssize_t n = read(read_fd, buf, sizeof(buf));
-                if (n > 0) {
-                    size_t i;
-                    for (i = 0; i < (size_t)n; i++) {
-                        char c = buf[i];
-                        if (partial_len + 1 < sizeof(partial)) {
-                            partial[partial_len++] = c;
-                        }
-                        if (c == '\n') {
-                            partial[partial_len] = 0;
-                            fputs(partial, stdout);
-                            partial_len = 0;
-                        }
-                        if (partial_len + 1 >= sizeof(partial)) {
-                            partial[partial_len] = 0;
-                            fputs(partial, stdout);
-                            partial_len = 0;
-                        }
-                    }
-                } else if (n == 0) {
-                    break;
-                } else {
-                    if (errno != EAGAIN && errno != EINTR) break;
-                }
-            }
-            time_t now = time(NULL);
-            if (now >= next_midnight) {
-                kill(strace_pid, SIGTERM);
-                int wait_count = 0;
-                while (wait_count < 10) {
-                    if (kill(strace_pid, 0) != 0) break;
-                    usleep(100*1000);
-                    wait_count++;
-                }
-                if (kill(strace_pid, 0) == 0) {
-                    kill(strace_pid, SIGKILL);
-                    usleep(200*1000);
-                }
-                int ztepid = find_zte_mifi_pid();
-                if (ztepid > 0) kill(ztepid, SIGCONT);
-                break;
-            }
-            int status = 0;
-            pid_t w = waitpid(strace_pid, &status, WNOHANG);
-            if (w == strace_pid) break;
-        }
-        close(read_fd);
-        waitpid(strace_pid, NULL, 0);
-        pid = find_zte_mifi_pid();
-        if (pid <= 0) return;
+    pid_t strace_pid = 0;
+    int read_fd = -1;
+    if (start_strace_with_pipe(pid, &strace_pid, &read_fd) != 0) {
+        perror("start_strace_with_pipe");
+        return;
     }
+    set_strace_pid_to_file(strace_pid);
+
+    char partial[MAX_BUFFER_LEN];
+    size_t partial_len = 0;
+    while (1) {
+        struct pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = read_fd;
+        pfd.events = POLLIN;
+        int pr = poll(&pfd, 1, 500);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            char buf[1024];
+            ssize_t n = read(read_fd, buf, sizeof(buf));
+            if (n > 0) {
+                size_t i;
+                for (i = 0; i < (size_t)n; i++) {
+                    char c = buf[i];
+                    if (partial_len + 1 < sizeof(partial)) {
+                        partial[partial_len++] = c;
+                    }
+                    if (c == '\n') {
+                        partial[partial_len] = 0;
+                        fputs(partial, stdout);
+                        partial_len = 0;
+                    }
+                    if (partial_len + 1 >= sizeof(partial)) {
+                        partial[partial_len] = 0;
+                        fputs(partial, stdout);
+                        partial_len = 0;
+                    }
+                }
+            } else if (n == 0) {
+                break;
+            } else {
+                if (errno != EAGAIN && errno != EINTR) break;
+            }
+        }
+        int status = 0;
+        pid_t w = waitpid(strace_pid, &status, WNOHANG);
+        if (w == strace_pid) break;
+    }
+    close(read_fd);
+    waitpid(strace_pid, NULL, 0);
 }
 
 // 用文件记录strace子进程pid，便于跨进程kill
@@ -268,7 +261,7 @@ void rerun_strace_zte_mifi() {
     }
 }
 
-// 查找 /sbin/zte_mifi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
+// 查找 /sbin/zte_mifi 或 /sbin/zte_ufi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
 int find_zte_mifi_pid() {
     DIR *dir;
     struct dirent *entry;
@@ -285,7 +278,7 @@ int find_zte_mifi_pid() {
         ssize_t len = readlink(path, buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
-            if (strcmp(buf, "/sbin/zte_mifi") == 0) {
+            if (strcmp(buf, "/sbin/zte_mifi") == 0 || strcmp(buf, "/sbin/zte_ufi") == 0) {
                 pid = id;
                 break;
             }
@@ -315,7 +308,6 @@ void* strace_thread_func(void* arg) {
             continue;
         }
         set_strace_pid_to_file(strace_pid);
-        time_t next_midnight = get_next_midnight_epoch();
 
         char partial[MAX_BUFFER_LEN];
         size_t partial_len = 0;
@@ -353,26 +345,6 @@ void* strace_thread_func(void* arg) {
                 }
             }
 
-            time_t now = time(NULL);
-            if (now >= next_midnight) {
-                kill(strace_pid, SIGTERM);
-                int wait_count = 0;
-                while (wait_count < 10) {
-                    if (kill(strace_pid, 0) != 0) break;
-                    usleep(100*1000);
-                    wait_count++;
-                }
-                if (kill(strace_pid, 0) == 0) {
-                    kill(strace_pid, SIGKILL);
-                    usleep(200*1000);
-                }
-                int ztepid = find_zte_mifi_pid();
-                if (ztepid > 0) {
-                    kill(ztepid, SIGCONT);
-                }
-                break;
-            }
-
             int status = 0;
             pid_t w = waitpid(strace_pid, &status, WNOHANG);
             if (w == strace_pid) break;
@@ -400,27 +372,6 @@ void* pdu_thread_func(void* arg) {
         }
     }
     return NULL;
-}
-
-// 提取 /tmp/zte_log.txt 中所有 write(数字, "内容", 数字) = 数字 的行
-void extract_write_lines_from_log() {
-    FILE *fp = fopen("/tmp/zte_log.txt", "r");
-    if (!fp) {
-        perror("fopen /tmp/zte_log.txt");
-        return;
-    }
-    char line[2048];
-    // 匹配 write(数字, "内容", 数字) = 数字
-    regex_t reg;
-    // 匹配如: write(16, "...", 91) = 91
-    regcomp(&reg, "^\\s*write\\([0-9]+, \\\".*\\\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
-    while (fgets(line, sizeof(line), fp)) {
-        if (regexec(&reg, line, 0, NULL, 0) == 0) {
-            printf("%s", line);
-        }
-    }
-    regfree(&reg);
-    fclose(fp);
 }
 
 // PDU解码信息结构体和解码函数
@@ -483,12 +434,6 @@ void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char
     }
 }
 
-static char last_sender[32] = "";
-static char last_text[2048] = "";
-static time_t last_sms_time = 0;
-static char last_pdu[256] = "";
-static time_t last_pdu_time = 0;
-static time_t service_start_time = 0;
 static char device_msisdn[64] = "";
 
 static void load_device_msisdn_from_nv_show(void) {
@@ -660,72 +605,24 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     free(ucs2_hex);
 }
 
-// 为保持兼容性保留的旧函数
-static char last_sms_compat[256] = "";
-static time_t last_sms_time_compat = 0;
-
-void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen) {
-    // 假设pdu内容全为UCS2编码的16进制字符串
-    size_t len = strlen(pdu);
+// JSON文本安全转义：将输入中的特殊字符转义后写入输出缓冲区
+static void json_escape(const char *src, char *dst, size_t dstsize) {
     size_t i = 0, j = 0;
-    // 兼容原逻辑：如果长度太短直接返回空
-    if (len < 4) { out[0] = 0; return; }
-    while (i + 3 < len && j + 3 < outlen) {
-        unsigned int ucs2;
-        if (sscanf(pdu + i, "%4x", &ucs2) != 1) break;
-        if (ucs2 == 0) break;
-        if (ucs2 < 0x80) {
-            out[j++] = (char)ucs2;
-        } else if (ucs2 < 0x800) {
-            out[j++] = 0xC0 | (ucs2 >> 6);
-            out[j++] = 0x80 | (ucs2 & 0x3F);
-        } else {
-            out[j++] = 0xE0 | (ucs2 >> 12);
-            out[j++] = 0x80 | ((ucs2 >> 6) & 0x3F);
-            out[j++] = 0x80 | (ucs2 & 0x3F);
-        }
-        i += 4;
-    }
-    out[j] = 0;
-}
-
-// 发送钉钉消息接口（只支持text）
-void send_dingtalk_msg(const char *webhook, const char *txt) {
-    // 构造钉钉 content 字段，带 Msg: 换行和 text:，并做严格JSON安全转义
-    char safe_txt[2048];
-    int i = 0, j = 0;
-    while (txt[i] && j < (int)sizeof(safe_txt) - 1) {
-        unsigned char c = (unsigned char)txt[i];
-        if (c == '"') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = '"'; }
-        } else if (c == '\\') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = '\\'; }
-        } else if (c == '\n') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = 'n'; }
-        } else if (c == '\r') {
-            if (j < (int)sizeof(safe_txt) - 2) { safe_txt[j++] = '\\'; safe_txt[j++] = 'n'; }
-        } else if (c == '\t') {
-            safe_txt[j++] = ' ';
-        } else if (c < 0x20) {
-            // 其它不可见控制字符直接跳过
-        } else {
-            safe_txt[j++] = c;
-        }
+    while (src[i] && j + 2 < dstsize) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"')      { dst[j++] = '\\'; dst[j++] = '"'; }
+        else if (c == '\\') { dst[j++] = '\\'; dst[j++] = '\\'; }
+        else if (c == '\n') { dst[j++] = '\\'; dst[j++] = 'n'; }
+        else if (c == '\r') { dst[j++] = '\\'; dst[j++] = 'n'; }
+        else if (c == '\t') { dst[j++] = ' '; }
+        else if (c >= 0x20) { dst[j++] = c; }
         i++;
     }
-    safe_txt[j] = 0;
-    // 构造完整 JSON
-    char json_msg[4096];
-    snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", safe_txt);
+    dst[j] = 0;
+}
 
-    // 直接用 mbedtls HTTPS POST 发送 JSON
-    char *host = NULL, *path = NULL;
-    parse_url(webhook, &host, &path);
-    if (!host || !path) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
-    }
+// 通过 mbedtls 发送 HTTPS POST 请求。tag 用于调试日志标识
+static void ssl_http_post(const char *host, const char *path, const char *json_body, const char *tag) {
     int ret = 0;
     mbedtls_net_context server_fd;
     mbedtls_ssl_context ssl;
@@ -739,35 +636,15 @@ void send_dingtalk_msg(const char *webhook, const char *txt) {
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
     const char *pers = "ssl_client";
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
-    }
-    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
-    }
-    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
-    }
+    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) return;
+    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) return;
+    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) return;
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
-    }
+    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) return;
     mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (host) free(host);
-            if (path) free(path);
-            return;
-        }
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) return;
     }
     char request_buffer[8192];
     snprintf(request_buffer, sizeof(request_buffer),
@@ -777,36 +654,257 @@ void send_dingtalk_msg(const char *webhook, const char *txt) {
              "Content-Length: %zu\r\n"
              "\r\n"
              "%s",
-             path, host, strlen(json_msg), json_msg);
-    // 调试输出实际发送的HTTP请求内容
-    printf("[DEBUG] HTTP Request:\n%s\n", request_buffer);
+             path, host, strlen(json_body), json_body);
+    printf("[DEBUG] %s HTTP Request:\n%s\n", tag, request_buffer);
     while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (host) free(host);
-            if (path) free(path);
-            return;
-        }
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) return;
     }
     unsigned char buf[1024];
     memset(buf, 0, sizeof(buf));
     ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-    // 可选：打印钉钉返回内容
-    if (ret > 0) {
-        printf("[DINGTALK] %s\n", buf);
-    }
-    if (host) free(host);
-    if (path) free(path);
+    if (ret > 0) printf("[%s] %s\n", tag, buf);
     mbedtls_net_free(&server_fd);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
-    return;
+}
+
+// 发送企业微信消息接口（只支持text）
+void send_wecom_msg(const char *webhook, const char *txt) {
+    char safe[2048], json_msg[4096];
+    char *host = NULL, *path = NULL;
+    json_escape(txt, safe, sizeof(safe));
+    snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", safe);
+    parse_url(webhook, &host, &path);
+    if (!host || !path) { if (host) free(host); if (path) free(path); return; }
+    ssl_http_post(host, path, json_msg, "WECOM");
+    free(host); free(path);
+}
+
+// 发送钉钉消息接口（只支持text）
+void send_dingtalk_msg(const char *webhook, const char *txt) {
+    char safe[2048], json_msg[4096];
+    char *host = NULL, *path = NULL;
+    json_escape(txt, safe, sizeof(safe));
+    snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", safe);
+    parse_url(webhook, &host, &path);
+    if (!host || !path) { if (host) free(host); if (path) free(path); return; }
+    ssl_http_post(host, path, json_msg, "DINGTALK");
+    free(host); free(path);
+}
+
+// 解析 Bark URL，提取 host 和 key。返回值: 1=HTTPS, 0=HTTP, -1=错误
+static int parse_bark_url(const char *url, char **host, char **bark_key) {
+    const char *start;
+    int use_ssl = 0;
+
+    if (strstr(url, "https://") == url) {
+        start = url + strlen("https://");
+        use_ssl = 1;
+    } else if (strstr(url, "http://") == url) {
+        start = url + strlen("http://");
+    } else {
+        *host = NULL;
+        *bark_key = NULL;
+        return -1;
+    }
+
+    const char *slash = strchr(start, '/');
+    if (!slash) {
+        *host = NULL;
+        *bark_key = NULL;
+        return -1;
+    }
+
+    size_t host_len = (size_t)(slash - start);
+    *host = (char *)malloc(host_len + 1);
+    memcpy(*host, start, host_len);
+    (*host)[host_len] = '\0';
+
+    const char *key_start = slash + 1;
+    while (*key_start == '/') key_start++;
+    const char *key_end = strchr(key_start, '/');
+    if (key_end && key_end > key_start) {
+        size_t key_len = (size_t)(key_end - key_start);
+        *bark_key = (char *)malloc(key_len + 1);
+        memcpy(*bark_key, key_start, key_len);
+        (*bark_key)[key_len] = '\0';
+    } else {
+        *bark_key = strdup(key_start);
+    }
+
+    return use_ssl;
+}
+
+// 发送 Bark 推送消息（支持 HTTP/HTTPS）
+void send_bark_msg(const char *webhook, const char *txt) {
+    char *host = NULL, *bark_key = NULL;
+    int use_ssl = parse_bark_url(webhook, &host, &bark_key);
+    if (!host || !bark_key) {
+        if (host) free(host);
+        if (bark_key) free(bark_key);
+        fprintf(stderr, "[BARK] Invalid URL format\n");
+        return;
+    }
+
+    char title[256];
+    char body[2048];
+    const char *newline = strchr(txt, '\n');
+    if (newline && newline > txt) {
+        size_t title_len = (size_t)(newline - txt);
+        if (title_len >= sizeof(title)) title_len = sizeof(title) - 1;
+        memcpy(title, txt, title_len);
+        title[title_len] = '\0';
+        snprintf(body, sizeof(body), "%s", newline + 1);
+    } else {
+        snprintf(title, sizeof(title), "短信通知");
+        snprintf(body, sizeof(body), "%s", txt);
+    }
+
+    char safe_body[4096];
+    json_escape(body, safe_body, sizeof(safe_body));
+
+    char safe_title[512];
+    json_escape(title, safe_title, sizeof(safe_title));
+
+    char json_msg[8192];
+    snprintf(json_msg, sizeof(json_msg),
+        "{\"title\":\"%s\",\"body\":\"%s\",\"group\":\"SMS\"}",
+        safe_title, safe_body);
+
+    char path_buf[512];
+    snprintf(path_buf, sizeof(path_buf), "/%s", bark_key);
+
+    const char *port = use_ssl ? "443" : "80";
+
+    int ret = 0;
+    mbedtls_net_context server_fd;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+
+    mbedtls_net_init(&server_fd);
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    const char *pers = "ssl_client";
+    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
+        goto bark_cleanup;
+    }
+
+    if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
+        fprintf(stderr, "[BARK] net_connect failed: -0x%x\n", -ret);
+        goto bark_cleanup;
+    }
+
+    if (use_ssl) {
+        if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+            goto bark_cleanup;
+        }
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+        if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
+            goto bark_cleanup;
+        }
+        mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+        while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                goto bark_cleanup;
+            }
+        }
+    }
+
+    char request_buffer[8192];
+    snprintf(request_buffer, sizeof(request_buffer),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json;charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n"
+        "%s",
+        path_buf, host, strlen(json_msg), json_msg);
+
+    printf("[DEBUG] Bark HTTP Request:\n%s\n", request_buffer);
+
+    if (use_ssl) {
+        while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                goto bark_cleanup;
+            }
+        }
+    } else {
+        ret = mbedtls_net_send(&server_fd, (const unsigned char *)request_buffer, strlen(request_buffer));
+        if (ret <= 0) {
+            fprintf(stderr, "[BARK] send failed: %d\n", ret);
+            goto bark_cleanup;
+        }
+    }
+
+    unsigned char buf[1024];
+    memset(buf, 0, sizeof(buf));
+    if (use_ssl) {
+        ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
+    } else {
+        ret = mbedtls_net_recv(&server_fd, buf, sizeof(buf) - 1);
+    }
+    if (ret > 0) {
+        printf("[BARK] %s\n", buf);
+    }
+
+bark_cleanup:
+    if (host) free(host);
+    if (bark_key) free(bark_key);
+    mbedtls_net_free(&server_fd);
+    mbedtls_ssl_free(&ssl);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
+}
+
+// 发送飞书消息接口（只支持text）
+void send_feishu_msg(const char *webhook, const char *txt) {
+    char safe[2048], json_msg[4096];
+    char *host = NULL, *path = NULL;
+    json_escape(txt, safe, sizeof(safe));
+    snprintf(json_msg, sizeof(json_msg), "{\"msg_type\":\"text\",\"content\":{\"text\":\"%s\"}}", safe);
+    parse_url(webhook, &host, &path);
+    if (!host || !path) { if (host) free(host); if (path) free(path); return; }
+    ssl_http_post(host, path, json_msg, "FEISHU");
+    free(host); free(path);
+}
+
+// 自动检测平台并发送消息的统一入口
+void send_webhook_msg(const char *webhook, const char *txt) {
+    webhook_platform_t platform = detect_platform(webhook);
+    switch (platform) {
+        case PLATFORM_WECOM:
+            printf("[INFO] 检测到企业微信平台, 使用企业微信规则推送\n");
+            send_wecom_msg(webhook, txt);
+            break;
+        case PLATFORM_DINGTALK:
+            printf("[INFO] 检测到钉钉平台, 使用钉钉规则推送\n");
+            send_dingtalk_msg(webhook, txt);
+            break;
+        case PLATFORM_BARK:
+            printf("[INFO] 检测到Bark平台, 使用Bark规则推送\n");
+            send_bark_msg(webhook, txt);
+            break;
+        case PLATFORM_FEISHU:
+            printf("[INFO] 检测到飞书平台, 使用飞书规则推送\n");
+            send_feishu_msg(webhook, txt);
+            break;
+        default:
+            printf("[INFO] 未匹配已知平台, 使用通用webhook格式尝试推送\n");
+            send_dingtalk_msg(webhook, txt);
+            break;
+    }
 }
 
 static void process_strace_line_for_sms(const char *line, const char *webhook, const char *headtxt, const char *tailtxt) {
-    (void)headtxt;
-    (void)tailtxt;
     char local[MAX_BUFFER_LEN];
     strncpy(local, line, sizeof(local) - 1);
     local[sizeof(local) - 1] = 0;
@@ -858,15 +956,19 @@ static void process_strace_line_for_sms(const char *line, const char *webhook, c
                     if (textlen > 0) {
                         if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
                             add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
-                            char msg[1024];
+                            char msg[1536];
                             snprintf(msg, sizeof(msg),
-                                "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
+                                "%s%s"
+                                "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s"
+                                "%s%s",
+                                headtxt ? headtxt : "", headtxt ? "\n" : "",
                                 device_msisdn[0] ? device_msisdn : "N/A",
                                 info.smsc[0] ? info.smsc : "N/A",
                                 info.sender[0] ? info.sender : "N/A",
                                 info.timestamp[0] ? info.timestamp : "N/A",
-                                info.text);
-                            send_dingtalk_msg(webhook, msg);
+                                info.text,
+                                tailtxt ? "\n" : "", tailtxt ? tailtxt : "");
+                            send_webhook_msg(webhook, msg);
                         } else {
                             printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
                         }
@@ -881,99 +983,6 @@ static void process_strace_line_for_sms(const char *line, const char *webhook, c
     }
 }
 
-// 提取日志中的PDU短信，解码、去重、发送到钉钉，支持自定义头尾
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt) {
-    FILE *fp = fopen("/tmp/zte_log.txt", "r");
-    if (!fp) return;
-    char line[2048];
-    regex_t reg;
-    // 匹配如: write(16, "...", 91) = 91，兼容C regex语法，不用\s和\)
-    regcomp(&reg, "^[ \t]*write\\([0-9]+, \".*\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
-    int line_num = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        line_num++;
-        int is_write = (regexec(&reg, line, 0, NULL, 0) == 0);
-        char *p = strstr(line, "+CMT: ");
-        // printf("[DEBUG] line %d: %s", line_num, line);
-        // printf("[DEBUG] is_write: %d\n", is_write);
-        // printf("[DEBUG] +CMT: pos: %ld\n", p ? (long)(p-line) : -1L);
-        if (p) {
-            // 修改这里：在strace输出中，换行符是字符串"\r\n"而不是实际的\r\n字符
-            char *first_crlf = strstr(p, "\\r\\n");
-            printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-line) : -1L);
-            if (first_crlf) {
-                // 修改这里：跳过"\r\n"字符串（4个字符）
-                char *pdu_start = first_crlf + 4;
-                printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-line));
-                // 同样查找结束标记也需要查找字符串"\r\n"
-                char *pdu_end = strstr(pdu_start, "\\r\\n");
-                if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-line));
-                char pdu[2048] = "";
-                if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
-                    strncpy(pdu, pdu_start, pdu_end - pdu_start);
-                    pdu[pdu_end - pdu_start] = 0;
-                } else {
-                    strncpy(pdu, pdu_start, sizeof(pdu)-1);
-                    pdu[sizeof(pdu)-1] = 0;
-                }
-                printf("[DEBUG] pdu_raw: %s\n", pdu);
-                printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
-                char *pdubegin = pdu;
-                while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
-                char *pdu_trim = pdubegin;
-                char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
-                while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
-                printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
-                printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
-                if (pdu_trim[0]) {
-                    // 过滤异常PDU：长度至少20且全为十六进制字符
-                    int valid_pdu = 1;
-                    size_t pdu_len = strlen(pdu_trim);
-                    size_t pi;
-                    if (pdu_len < 20) valid_pdu = 0;
-                    for (pi = 0; pi < pdu_len; pi++) {
-                        char c = pdu_trim[pi];
-                        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
-                            valid_pdu = 0;
-                            break;
-                        }
-                    }
-                    if (valid_pdu) {
-                        sms_info_t info;
-                        decode_pdu(pdu_trim, &info);
-                        printf("[DEBUG] sms_decoded: %s\n", info.text);
-                        printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
-                        size_t textlen = strlen(info.text);
-                        if (textlen > 0) { // 只推送有内容的短信
-                            // 新去重机制：Sender+TimeStamp+Text三元组唯一
-                            if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
-                                add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
-                                char msg[1024];
-                                snprintf(msg, sizeof(msg),
-                                    "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
-                                    device_msisdn[0] ? device_msisdn : "N/A",
-                                    info.smsc[0] ? info.smsc : "N/A",
-                                    info.sender[0] ? info.sender : "N/A",
-                                    info.timestamp[0] ? info.timestamp : "N/A",
-                                    info.text);
-                                send_dingtalk_msg(webhook, msg);
-                            } else {
-                                printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
-                            }
-                        }
-                    } else {
-                        printf("[DEBUG] skip invalid pdu: %s\n", pdu_trim);
-                    }
-                }
-            } else {
-                printf("[DEBUG] first_crlf not found after +CMT:\n");
-            }
-        }
-    }
-    regfree(&reg);
-    fclose(fp);
-}
-
 // 打印 mbedtls 错误码的帮助函数
 void print_mbedtls_error(int ret, const char *msg) {
     fprintf(stderr, "%s failed: -0x%x\n", msg, -ret);
@@ -986,6 +995,8 @@ void parse_url(const char *url, char **host, char **path) {
 
     if (strstr(url, "https://") == url) {
         start = (char *)url + strlen("https://");
+    } else if (strstr(url, "http://") == url) {
+        start = (char *)url + strlen("http://");
     } else {
         *host = NULL;
         *path = NULL;
@@ -1030,6 +1041,7 @@ int main(int argc, char *argv[]) {
     int only_rerun_mode = 0;
     int only_send_once_mode = 0; // 新增
     char *headtxt = NULL, *tailtxt = NULL;
+    char *manual_msisdn = NULL;
     int i;
     for (i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--mode=strace_zte_mifi") == 0)) {
@@ -1050,6 +1062,9 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
             tailtxt = argv[i] + 10;
         }
+        if (strncmp(argv[i], "--num=", 6) == 0) {
+            manual_msisdn = argv[i] + 6;
+        }
     }
     if (only_strace_mode && argc == 2) {
         trace_zte_mifi();
@@ -1060,7 +1075,6 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     if (only_service_mode) {
-        service_start_time = time(NULL);
         char *webhook = NULL;
         for (i = 1; i < argc; i++) {
             if (strncmp(argv[i], "--url=", 6) == 0) {
@@ -1071,9 +1085,18 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --mode=service_start 时必须指定 --url=<webhook_url> 参数！\n");
             return 1;
         }
-        load_device_msisdn_from_nv_show();
+        if (manual_msisdn && manual_msisdn[0]) {
+            strncpy(device_msisdn, manual_msisdn, sizeof(device_msisdn) - 1);
+            device_msisdn[sizeof(device_msisdn) - 1] = 0;
+        } else {
+            load_device_msisdn_from_nv_show();
+            if (!device_msisdn[0]) {
+                strncpy(device_msisdn, "读取手机号失败 请使用 --num=参数进行手动添加", sizeof(device_msisdn) - 1);
+                device_msisdn[sizeof(device_msisdn) - 1] = 0;
+            }
+        }
         printf("Alice Pushbot - Service mode starting.\n");
-        printf("Target: /sbin/zte_mifi (strace attached).\n");
+        printf("Target: /sbin/zte_mifi or zte_ufi (strace attached).\n");
         printf("Press Ctrl+C to stop.\n");
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);

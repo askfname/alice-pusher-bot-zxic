@@ -27,7 +27,7 @@
 #include "../.build/sponsor_asset.h"
 
 #define MAX_BUFFER_LEN 4096
-#define DEFAULT_WEBUI_PORT 51401
+#define DEFAULT_WEBUI_PORT 51402
 #define DEFAULT_CONFIG_PATH "/mnt/userdata/etc_rw/alice_pusher.conf"
 #define DEFAULT_SERVICE_PID "/tmp/alice_pusher_service.pid"
 #define DEFAULT_LOG_PATH "/tmp/alice_pusher.log"
