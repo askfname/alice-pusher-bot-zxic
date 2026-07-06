@@ -984,6 +984,25 @@ static int post_https_body(const char *webhook, const char *ctype,
     }
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+  
+    // SNI
+    mbedtls_ssl_set_hostname(&ssl, host);
+    
+    // 强制 TLS 1.2+
+    mbedtls_ssl_conf_min_version(
+        &conf,
+        MBEDTLS_SSL_MAJOR_VERSION_3,
+        MBEDTLS_SSL_MINOR_VERSION_3
+    );
+
+    // 指定 cipher suite
+    const int ciphers[] = {
+        MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        0
+    };
+    mbedtls_ssl_conf_ciphersuites(&conf, ciphers);
+
     if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
         print_mbedtls_error(ret, "mbedtls_ssl_setup");
         goto cleanup_tls;
